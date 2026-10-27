@@ -1,0 +1,7 @@
+[test]
+preload = []
+coverage = true
+
+[install]
+exact = true
+frozenLockfile = false
