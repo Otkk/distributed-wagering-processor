@@ -12,11 +12,23 @@ export enum FailureCode {
   INTERNAL_ERROR = 'INTERNAL_ERROR',
 }
 
-export abstract class DomainError extends Error {
+export class DomainError extends Error {
   constructor(message: string) {
     super(message);
     this.name = this.constructor.name;
     Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export class InvalidOperationError extends DomainError {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+export class WalletOwnershipError extends DomainError {
+  constructor(playerId: string, walletId: string) {
+    super(`Player ${playerId} does not own wallet ${walletId}`);
   }
 }
 

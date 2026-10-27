@@ -87,26 +87,7 @@ export class ProcessWagerTransactionUseCase {
         }
       }
 
-      // 3. Verificação de Idempotência
-      const existingTx = await this.txRepo.findByIdempotencyKey(input.idempotencyKey);
-      if (existingTx) {
-        if (existingTx.matchesPayload(payloadHash)) {
-          // Replay idêntico
-          const wallet = await this.walletRepo.findById(input.walletId);
-          return {
-            transactionId: existingTx.id,
-            status: existingTx.status,
-            balance: wallet ? wallet.balance.toJSON() : money.toJSON(),
-            idempotentReplay: true,
-            failureCode: existingTx.failureCode,
-          };
-        } else {
-          // Mesma chave com payload divergente = Conflito
-          throw new IdempotencyConflictError(input.idempotencyKey);
-        }
-      }
-
-      // 4. Concorrência: Pessimistic Lock na Wallet
+      // 3. Concorrência: Pessimistic Lock na Wallet (Unidade de concorrência é a walletId)
       const wallet = await this.walletRepo.findById(input.walletId, 'pessimistic_write');
       if (!wallet) {
         throw new WalletNotFoundError(input.walletId);
@@ -116,6 +97,24 @@ export class ProcessWagerTransactionUseCase {
       }
       if (wallet.currency !== money.currency) {
         throw new CurrencyMismatchError(wallet.currency, money.currency);
+      }
+
+      // 4. Verificação de Idempotência sob o Lock da Carteira
+      const existingTx = await this.txRepo.findByIdempotencyKey(input.idempotencyKey);
+      if (existingTx) {
+        if (existingTx.matchesPayload(payloadHash)) {
+          // Replay idêntico
+          return {
+            transactionId: existingTx.id,
+            status: existingTx.status,
+            balance: wallet.balance.toJSON(),
+            idempotentReplay: true,
+            failureCode: existingTx.failureCode,
+          };
+        } else {
+          // Mesma chave com payload divergente = Conflito
+          throw new IdempotencyConflictError(input.idempotencyKey);
+        }
       }
 
       const now = new Date();
