@@ -9,7 +9,7 @@
   "scripts": {
     "start": "bun run src/main.ts",
     "start:dev": "bun --watch run src/main.ts",
-    "build": "bun build ./src/main.ts --outdir ./dist --target node",
+    "build": "bun build ./src/main.ts --outdir ./dist --target node --external @nestjs/microservices --external @nestjs/websockets --external @nestjs/platform-socket.io",
     "test": "bun test tests/unit",
     "test:integration": "bun test tests/integration",
     "test:concurrency": "bun test tests/concurrency",

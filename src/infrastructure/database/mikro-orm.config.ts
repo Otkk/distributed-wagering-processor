@@ -1,5 +1,10 @@
-import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
+import { defineConfig } from '@mikro-orm/postgresql';
+import { InboxMessageEntity } from './entities/inbox-message.entity';
+import { OutboxMessageEntity } from './entities/outbox-message.entity';
+import { WagerTransactionEntity } from './entities/wager-transaction.entity';
+import { WalletLedgerEntryEntity } from './entities/wallet-ledger-entry.entity';
+import { WalletEntity } from './entities/wallet.entity';
 
 export default defineConfig({
   host: process.env.DB_HOST || 'localhost',
@@ -7,8 +12,13 @@ export default defineConfig({
   user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD || 'postgres',
   dbName: process.env.DB_NAME || 'wagering_db',
-  entities: ['./dist/src/infrastructure/database/entities', './src/infrastructure/database/entities'],
-  entitiesTs: ['./src/infrastructure/database/entities'],
+  entities: [
+    WalletEntity,
+    WagerTransactionEntity,
+    WalletLedgerEntryEntity,
+    InboxMessageEntity,
+    OutboxMessageEntity,
+  ],
   migrations: {
     path: './dist/src/infrastructure/database/migrations',
     pathTs: './src/infrastructure/database/migrations',
