@@ -76,6 +76,14 @@ export class OutboxMessage {
     );
   }
 
+  /**
+   * Reserva temporariamente a mensagem (short lease) sem incrementar attempts,
+   * permitindo fechar a transação SQL antes do I/O de rede para o SQS.
+   */
+  public claimLease(now: Date, leaseMs = 30000): void {
+    this._nextAttemptAt = new Date(now.getTime() + leaseMs);
+  }
+
   public markPublished(at: Date): void {
     this._publishedAt = at;
   }

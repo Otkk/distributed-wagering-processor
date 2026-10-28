@@ -2,17 +2,25 @@ import { EntityManager } from '@mikro-orm/postgresql';
 import { WagerTransactionRepository } from '../../../domain/ports/repositories.port';
 import { WagerTransaction, WagerTransactionStatus } from '../../../domain/models/wager-transaction';
 import { WagerTransactionEntity } from '../entities/wager-transaction.entity';
+import { MikroOrmBaseRepository } from './mikro-orm-base.repository';
 
-export class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
-  constructor(private readonly em: EntityManager) {}
+export class MikroOrmWagerTransactionRepository
+  extends MikroOrmBaseRepository
+  implements WagerTransactionRepository
+{
+  constructor(em: EntityManager) {
+    super(em);
+  }
 
   public async findById(id: string): Promise<WagerTransaction | null> {
-    const entity = await this.em.findOne(WagerTransactionEntity, { id });
+    const em = this.getEm();
+    const entity = await em.findOne(WagerTransactionEntity, { id });
     return entity ? entity.toDomain() : null;
   }
 
   public async findByIdempotencyKey(key: string): Promise<WagerTransaction | null> {
-    const entity = await this.em.findOne(WagerTransactionEntity, { idempotencyKey: key });
+    const em = this.getEm();
+    const entity = await em.findOne(WagerTransactionEntity, { idempotencyKey: key });
     return entity ? entity.toDomain() : null;
   }
 
@@ -20,7 +28,8 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
     providerId: string,
     externalId: string,
   ): Promise<WagerTransaction | null> {
-    const entity = await this.em.findOne(WagerTransactionEntity, {
+    const em = this.getEm();
+    const entity = await em.findOne(WagerTransactionEntity, {
       providerId,
       externalTransactionId: externalId,
     });
@@ -28,7 +37,8 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
   }
 
   public async findPendingReferences(limit: number): Promise<WagerTransaction[]> {
-    const entities = await this.em.find(
+    const em = this.getEm();
+    const entities = await em.find(
       WagerTransactionEntity,
       { status: WagerTransactionStatus.PendingReference },
       { limit, orderBy: { createdAt: 'ASC' } },
@@ -38,18 +48,23 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
 
   public async findProcessedReversal(
     referenceTransactionId: string,
-    kind: string,
+    kind?: string,
   ): Promise<WagerTransaction | null> {
-    const entity = await this.em.findOne(WagerTransactionEntity, {
+    const em = this.getEm();
+    const where: Record<string, unknown> = {
       referenceTransactionId,
-      kind,
       status: WagerTransactionStatus.Processed,
-    });
+    };
+    if (kind) {
+      where.kind = kind;
+    }
+    const entity = await em.findOne(WagerTransactionEntity, where);
     return entity ? entity.toDomain() : null;
   }
 
   public async save(transaction: WagerTransaction): Promise<void> {
+    const em = this.getEm();
     const entity = WagerTransactionEntity.fromDomain(transaction);
-    await this.em.upsert(WagerTransactionEntity, entity);
+    await em.upsert(WagerTransactionEntity, entity);
   }
 }

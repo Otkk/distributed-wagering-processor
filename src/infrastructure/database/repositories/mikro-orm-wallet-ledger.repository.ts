@@ -6,26 +6,34 @@ import {
 } from '../../../domain/ports/repositories.port';
 import { WalletLedgerEntry } from '../../../domain/models/wallet-ledger-entry';
 import { WalletLedgerEntryEntity } from '../entities/wallet-ledger-entry.entity';
+import { MikroOrmBaseRepository } from './mikro-orm-base.repository';
 
 interface CursorData {
   createdAt: string;
   id: string;
 }
 
-export class MikroOrmWalletLedgerRepository implements WalletLedgerRepository {
-  constructor(private readonly em: EntityManager) {}
+export class MikroOrmWalletLedgerRepository
+  extends MikroOrmBaseRepository
+  implements WalletLedgerRepository
+{
+  constructor(em: EntityManager) {
+    super(em);
+  }
 
   public async save(entry: WalletLedgerEntry): Promise<void> {
+    const em = this.getEm();
     const entity = WalletLedgerEntryEntity.fromDomain(entry);
-    await this.em.persistAndFlush(entity);
+    await em.persistAndFlush(entity);
   }
 
   public async findByWalletId(
     walletId: string,
     options?: { limit: number; cursor?: string },
   ): Promise<LedgerPaginationResult> {
+    const em = this.getEm();
     const limit = options?.limit || 50;
-    const qb = this.em.createQueryBuilder(WalletLedgerEntryEntity, 'l');
+    const qb = em.createQueryBuilder(WalletLedgerEntryEntity, 'l');
 
     qb.where({ walletId });
 
@@ -66,8 +74,9 @@ export class MikroOrmWalletLedgerRepository implements WalletLedgerRepository {
   }
 
   public async calculateBalance(walletId: string): Promise<{ calculatedAmount: string; count: number }> {
-    const knex = this.em.getKnex();
-    const result = await knex('wallet_ledger_entries')
+    const em = this.getEm();
+    const knex = em.getKnex();
+    const query = knex('wallet_ledger_entries')
       .where('wallet_id', walletId)
       .select(
         knex.raw(
@@ -76,6 +85,13 @@ export class MikroOrmWalletLedgerRepository implements WalletLedgerRepository {
         knex.raw('COUNT(*) as count'),
       )
       .first();
+
+    const txCtx = typeof em.getTransactionContext === 'function' ? em.getTransactionContext() : undefined;
+    if (txCtx && typeof (query as unknown as { transacting?: (trx: unknown) => void }).transacting === 'function') {
+      (query as unknown as { transacting: (trx: unknown) => void }).transacting(txCtx);
+    }
+
+    const result = await query;
 
     const rawAmount = String(result?.calculated_amount ?? '0.00');
     const decimalAmount = new Decimal(rawAmount).toDecimalPlaces(2, Decimal.ROUND_HALF_EVEN);

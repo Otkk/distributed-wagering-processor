@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { OutboxMessage } from '../../../domain/models/outbox-message';
 
@@ -11,7 +11,10 @@ export class SqsEventPublisher implements EventPublisherPort {
   private readonly sqsClient: SQSClient;
   private readonly eventsQueueUrl: string;
 
-  constructor(sqsClient?: SQSClient, eventsQueueUrl?: string) {
+  constructor(
+    @Optional() @Inject('SQS_CLIENT') sqsClient?: SQSClient,
+    @Optional() @Inject('SQS_EVENTS_QUEUE_URL') eventsQueueUrl?: string,
+  ) {
     this.sqsClient =
       sqsClient ??
       new SQSClient({
@@ -25,8 +28,9 @@ export class SqsEventPublisher implements EventPublisherPort {
 
     this.eventsQueueUrl =
       eventsQueueUrl ??
-      (process.env.SQS_EVENTS_QUEUE_URL ||
-        'http://localhost:4566/000000000000/wagering-events.fifo');
+      (process.env.SQS_OUTBOX_QUEUE_URL ||
+        process.env.SQS_EVENTS_QUEUE_URL ||
+        'http://localhost:4566/000000000000/wager-transactions.fifo');
   }
 
   public async publish(outboxMessage: OutboxMessage): Promise<void> {

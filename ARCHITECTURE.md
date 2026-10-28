@@ -146,22 +146,25 @@ Para que o provedor de jogos saiba exatamente quando deve **parar** (erro defini
 
 ## 7. Mensageria Assíncrona: SQS, Transactional Outbox, Inbox e Referências Fora de Ordem
 
-### 7.1 Transactional Outbox (`OutboxDispatcherWorker`)
+### 7.1 Transactional Outbox (`OutboxDispatcherWorker` — Padrão *Claim-Publish-Confirm*)
 - Eventos de integração ([`WalletBalanceChanged`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/events.ts), [`WagerTransactionProcessed`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/events.ts), [`WagerTransactionRejected`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/events.ts), [`WagerTransactionPendingReference`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/events.ts)) herdam da classe abstrata [`IntegrationEvent<T>`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/integration-event.ts) e **nunca** são publicados no broker antes do commit do banco.
 - Eles são serializados na tabela `outbox_messages` dentro da mesma transação SQL que altera o saldo e o ledger.
-- O [`OutboxDispatcherWorker`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/messaging/outbox/outbox-dispatcher.worker.ts) faz polling utilizando:
-  ```sql
-  SELECT * FROM outbox_messages
-  WHERE published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-  ORDER BY occurred_at ASC
-  LIMIT 50
-  FOR UPDATE SKIP LOCKED;
-  ```
-- Isso permite que $N$ instâncias da aplicação publiquem lotes simultaneamente sem colisão. Se o processo morrer após o commit no banco e antes da publicação no SQS, outra instância assume o registro na próxima janela de polling. Em caso de falha no SQS, aplica *exponential backoff* ($\min(2^{\text{attempts}} \times 500\text{ms}, 60\text{s})$).
+- Para evitar segurar conexões ou locks do PostgreSQL abertos durante chamadas de rede para o AWS SQS, o [`OutboxDispatcherWorker`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/messaging/outbox/outbox-dispatcher.worker.ts) implementa o protocolo **Claim-Publish-Confirm** em 3 fases:
+  1. **Fase 1 — Claim (Transação SQL curta, `< 2 ms`)**: seleciona um lote pendente vinculado ao `TransactionContext` ativo via:
+     ```sql
+     SELECT * FROM outbox_messages
+     WHERE published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+     ORDER BY occurred_at ASC
+     LIMIT 50
+     FOR UPDATE SKIP LOCKED;
+     ```
+     e aplica imediatamente um *short lease* (`claimLease`: `next_attempt_at = NOW() + 30s`, sem incrementar `attempts`), comitando a transação SQL antes de iniciar qualquer I/O de rede.
+  2. **Fase 2 — Publish (Fora da transação SQL)**: publica cada mensagem no AWS SQS FIFO via `@aws-sdk/client-sqs` (`MessageGroupId = aggregateId`, `MessageDeduplicationId = outbox.id`) sem manter nenhuma transação aberta no PostgreSQL.
+  3. **Fase 3 — Confirm (Transação SQL curta)**: grava `published_at = NOW()` em caso de sucesso ou chama `scheduleRetry(now)` (incrementando `attempts` e agendando *exponential backoff* $\min(2^{\text{attempts}} \times 500\text{ms}, 60\text{s})$) em caso de falha. Se o processo sofrer `SIGKILL` durante a Fase 2, o lease de 30s expira automaticamente e outra instância assume o envio.
 
 ### 7.2 Consumer SQS, Persistent Inbox, DLQ e Graceful Shutdown (`SIGTERM`)
 - O [`WagerTransactionConsumer`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/messaging/sqs/wager-transaction.consumer.ts) consome a fila FIFO `wager-transactions.fifo` reutilizando exatamente o mesmo `ProcessWagerTransactionUseCase`.
-- **Deduplicação via Inbox**: cada mensagem recebida é registrada na tabela `inbox_messages` (`PRIMARY KEY (consumer_name, message_id)`) dentro da mesma transação SQL da aposta.
+- **Deduplicação via Inbox**: cada mensagem recebida é registrada na tabela `inbox_messages` (`PRIMARY KEY (consumer_name, message_id)`) dentro da mesma transação SQL da aposta, sob o lock pessimista da carteira.
 - **ACK Estritamente Pós-Commit**: o comando `DeleteMessage` no SQS só é invocado **após** o commit da transação no PostgreSQL. Se o worker morrer entre o commit e o ACK, o SQS reentregará a mensagem após o *Visibility Timeout*; a segunda instância detectará o registro já processado em `inbox_messages` (e a `idempotency_key` em `wager_transactions`) e confirmará o ACK sem duplicar o débito/crédito.
 - **Classificação de Falhas e DLQ**:
   - *Rejeição de negócio* (`INSUFFICIENT_FUNDS`, etc.): a transação é gravada como `REJECTED`, o evento `WagerTransactionRejected` vai para a Outbox e a mensagem recebe **ACK** (não é erro de fila).
@@ -179,45 +182,44 @@ Para que o provedor de jogos saiba exatamente quando deve **parar** (erro defini
 
 ## 8. Autenticação e Identidade de Provedores (Seção 2)
 
-Em conformidade com a Seção 2 do desafio, não implementamos cadastro de usuários ou emissão de credenciais. Em vez disso, definimos a porta [`ProviderIdentityPort`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts) consumida pelo [`AuthGuard`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts):
-- Os endpoints `/health/live`, `/health/ready` e `/health/metrics` são explicitamente públicos (`path.startsWith('/health')`).
-- Para os endpoints de negócio (`/wallets`, `/wagering`), o `AuthGuard` extrai `x-provider-id` e o header `Authorization: Bearer <token>`, delegando a validação ao `ProviderIdentityPort`.
-- No MVP, injetamos o adaptador `NoopProviderIdentityPort`. Em ambiente de produção, basta substituir a injeção por um `OidcJwksProviderIdentityAdapter` (validando assinatura RS256/ES256 via JWKS de um IdP como **Keycloak**, **Zitadel** ou **AWS Cognito** e verificando se a claim `provider_id` do token corresponde ao `providerId` do payload) ou por validação de assinatura `X-Provider-Signature` (HMAC-SHA256).
+Em conformidade com a Seção 2 do desafio (que define autenticação como opcional e fora do foco central de consistência/concorrência), não implementamos cadastro de usuários ou emissão artesanal de credenciais. Definimos a porta de extensão [`ProviderIdentityPort`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts) consumida pelo [`AuthGuard`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts):
+- Os endpoints `/health/live`, `/health/ready` e `/health/metrics` são explicitamente abertos (`path.startsWith('/health')`).
+- No MVP, o adaptador `NoopProviderIdentityPort` está registrado por padrão para facilitar os testes funcionais e de carga. Em produção, basta substituir o provider `ProviderIdentityPort` por um adaptador OIDC/JWKS (**Keycloak**, **Zitadel**, **AWS Cognito**) ou validação HMAC-SHA256 (`X-Provider-Signature`).
 
 ---
 
-## 9. Experimento de Carga (`bun run test:load`) e Análise de Desempenho
+## 9. Experimento de Carga Real (`bun run test:load` — HTTP + PostgreSQL + SQS + `autocannon`)
 
-Implementamos o benchmark automatizado em [`tests/load/load-test.ts`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/tests/load/load-test.ts) (executável via `bun run test:load`), avaliando dois perfis contrastantes de carga com simulação realista de I/O de lock de linha (`1 ms` por aquisição de `SELECT ... FOR UPDATE`).
+Implementamos o benchmark automatizado em [`tests/load/load-test.ts`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/tests/load/load-test.ts) (executável via `bun run test:load`), que sobe a **aplicação NestJS real escutando via HTTP**, conectada a uma instância **real do PostgreSQL** (executando `SELECT ... FOR UPDATE`, `INSERT`, `UPDATE`, `COMMIT` com escrita em disco) e publica os eventos da Outbox via HTTP usando `@aws-sdk/client-sqs`.
 
 ### 9.1 Ambiente do Experimento
 - **SO / Arquitetura**: Windows 11 (`win32 10.0.26200 x64`)
 - **CPU**: Intel(R) Core(TM) i7-10750H @ 2.60GHz (12 logical cores)
-- **Memória RAM**: 15.87 GB
-- **Runtime**: Bun `1.4.4`
+- **Memória RAM**: 15.9 GB
+- **Runtime**: Bun `1.4.4` + NestJS `10.4` + MikroORM `6.3`
+- **Banco de Dados**: PostgreSQL `18.6` (`x86_64-windows`, transações ACID reais com `SELECT ... FOR UPDATE`)
 
-### 9.2 Metodologia e Resultados Obtidos
+### 9.2 Metodologia e Resultados Reais Obtidos
 
-| Métrica | Perfil A: Multi-Wallet (50 carteiras em paralelo, 30 ops/carteira) | Perfil B: Hot Wallet + Tempestade de Idempotência (500 reqs em rajadas de 50 sobre 1 única carteira) |
-|---|---|---|
-| **Requisições Totais** | `1.500` | `500` (100 únicas + 400 replays concorrentes) |
-| **Tempo Total** | `86,05 ms` | `848,56 ms` |
-| **Throughput** | **`17.432,01 req/s`** | **`589,24 req/s`** |
-| **Latência p50** | `2,434 ms` | `43,249 ms` |
-| **Latência p95** | `5,120 ms` | `81,541 ms` |
-| **Latência p99** | `9,327 ms` | `85,173 ms` |
-| **Latência Máxima** | `9,707 ms` | `86,463 ms` |
-| **Conflitos / Fila de Lock** | `0` aquisições enfileiradas | `490` aquisições enfileiradas no lock da carteira |
-| **Desfecho de Negócio** | `1.500 PROCESSED` | `66 PROCESSED`, `34 REJECTED` (`INSUFFICIENT_FUNDS`), `400 REPLAYS` |
-| **Taxa de Erro (5xx)** | **`0,00%`** | **`0,00%`** |
-| **Invariante Final (`balance == ledger`)** | **100% consistente** | **100% consistente** (`10.00 BRL` final exato) |
+| Métrica | Perfil A: Multi-Wallet HTTP Write (20 carteiras paralelas × 20 ops HTTP POST) | Perfil B: Hot Wallet + Idempotency Storm (1 carteira, 8 rajadas × 25 HTTP POSTs simultâneos) | Perfil C: `autocannon` HTTP Reconciliation (20 conexões simultâneas, 2s em `GET /wallets/:id/reconcile`) |
+|---|---|---|---|
+| **Requisições HTTP Totais** | `400` (`POST /wagering/transactions`) | `200` (`POST /wagering/transactions` na mesma carteira) | `3.140` (`GET /wallets/:id/reconcile`) |
+| **Tempo Total** | `1.701,50 ms` | `696,87 ms` | `2.000,00 ms` |
+| **Throughput Real** | **`235,09 req/s`** (transações ACID completas) | **`287,00 req/s`** (sob contenção de linha) | **`1.570,00 req/s`** (agregação SQL `SUM` no ledger) |
+| **Latência p50** | `74,05 ms` | `40,88 ms` | `11,00 ms` |
+| **Latência p95 / p97.5** | `186,58 ms` (p95) | `90,64 ms` (p95) | `19,00 ms` (p97.5) |
+| **Latência p99** | `293,13 ms` | `114,04 ms` | `19,00 ms` |
+| **Desfecho de Negócio** | `400 PROCESSED` (`200 OK`) | `50 PROCESSED`, `38 REJECTED` (`422`), `112 IDEMPOTENT_REPLAY` | `3.140` reconciliações `consistent: true` |
+| **Taxa de Erro (5xx)** | **`0,00%`** | **`0,00%`** | **`0,00%`** |
+| **Invariante Final (`balance == ledger`)** | **100% consistente** (`20/20` carteiras) | **100% consistente** (`1/1` hot wallet) | **100% consistente** (`discrepancy = 0.00`) |
 
-- **Drenagem da Outbox**: `3.017` eventos de integração despachados em `3,12 ms` com `outboxLagMs` máximo de `70 ms`.
-- **Reconciliação Final**: `51/51` carteiras auditadas ao final do teste com diferença contábil zero (`0.00 BRL`) em todos os `1.417` lançamentos do ledger.
+- **Drenagem da Outbox para SQS**: `861` eventos de integração lidos do PostgreSQL (`FOR UPDATE SKIP LOCKED`) e publicados via HTTP `@aws-sdk/client-sqs` com `0` falhas.
+- **Reconciliação Pós-Carga**: `21/21` carteiras verificadas no PostgreSQL real com discrepância contábil `0.00 BRL`.
 
 ### 9.3 Análise Crítica dos Resultados e Trade-offs
-1. **Escalabilidade Horizontal em Carteiras Distintas (Perfil A)**: como o lock pessimista tem granularidade estrita por `walletId`, carteiras diferentes não disputam recursos entre si. O throughput escala linearmente com o número de conexões e instâncias da aplicação (`> 17.400 req/s` em memória/I/O simulado, limitado em produção apenas pelo IOPS e pool de conexões do PostgreSQL).
-2. **Comportamento sob *Hot Wallet* Extrema (Perfil B)**: quando 50 requisições atingem **a mesma carteira** no mesmo instante, a fila do lock pessimista serializa a execução (Pela Lei de Little, $L = \lambda \times W$: com 50 requisições simultâneas e $\sim 1,7\text{ ms}$ de tempo de serviço sob lock, o `p99` sobe previsivelmente para $\sim 85\text{ ms}$). Esse é um *trade-off* deliberado: preferimos uma latência de cauda de `85 ms` com **zero erros 5xx e 100% de exatidão financeira** a permitir leituras sujas (*dirty reads*) ou tempestades de *optimistic lock abort*.
+1. **Custo Real de Durabilidade ACID no Perfil A (`235 req/s` em 20 carteiras paralelas)**: cada `POST /wagering/transactions` aprovado executa uma transação SQL completa no PostgreSQL com `SELECT ... FOR UPDATE` na carteira, `SELECT` de idempotência, `UPSERT` na carteira, `UPSERT` na transação, `INSERT` no ledger append-only (com trigger de imutabilidade), 2 `UPSERT`s de eventos na tabela `outbox_messages` e `COMMIT` (WAL flush em disco). O gargalo aqui não é CPU da aplicação, mas o `fsync` do WAL no disco local e o tamanho do pool de conexões (`max = 25`).
+2. **Contenção de Linha e Tempestade de Idempotência no Perfil B (`287 req/s`, `p99 = 114 ms`)**: quando 25 requisições HTTP atingem **a mesma carteira** simultaneamente (incluindo 15 replays concorrentes com a mesma `Idempotency-Key`), o `SELECT ... FOR UPDATE` do PostgreSQL enfileira as transações na linha da carteira. Assim que a primeira transação comita, as 14 duplicatas subsequentes leem o estado terminal já comitado e retornam `idempotentReplay: true` sem escrever no ledger nem na outbox (por isso o `p50` cai para `40,88 ms`), mantendo **zero erros 5xx** e **zero saldo negativo**.
+3. **Leitura e Reconciliação (`1.570 req/s` via `autocannon`)**: consultas de leitura (`GET /wallets/:id/reconcile`) usam forks limpos sem lock pessimista, atingindo `p50 = 11 ms` e `p99 = 19 ms` com 20 conexões simultâneas.
 
 ---
 
@@ -227,8 +229,9 @@ Implementamos o benchmark automatizado em [`tests/load/load-test.ts`](file:///c:
    - *Limitação no MVP*: todas as entradas permanecem na tabela principal.
    - *Evolução*: particionamento declarativo do PostgreSQL (`PARTITION BY RANGE (created_at)`) mensal/semanal e job de expurgo/arquivamento de registros `outbox_messages` já publicados (`published_at < NOW() - INTERVAL '7 days'`) e `inbox_messages` antigos.
 2. **Pool de Conexões sob Múltiplas Instâncias**:
-   - *Limitação no MVP*: cada instância gerencia seu próprio pool direto no PostgreSQL.
-   - *Evolução*: introdução de **PgBouncer** em modo *transaction pooling* na frente do PostgreSQL e definição de `lock_timeout` (ex.: `3000ms`) e `statement_timeout` por sessão para evitar que uma transação lenta segure conexões do pool.
+   - *Limitação no MVP*: cada instância gerencia seu próprio pool direto no PostgreSQL (`DB_POOL_MAX=25`).
+   - *Evolução*: introdução de **PgBouncer** em modo *transaction pooling* na frente do PostgreSQL e definição de `lock_timeout` (ex.: `3000ms`) e `statement_timeout` por sessão para evitar que uma transação lenta esgote conexões do pool.
 3. **Observabilidade Distribuída**:
    - *Limitação no MVP*: métricas expostas via snapshot JSON em `/health/metrics` e logs estruturados via Pino.
    - *Evolução*: exportação nativa no formato Prometheus (`prom-client`) e instrumentação de *traces* distribuídos via **OpenTelemetry SDK** propagando `traceparent` nos atributos das mensagens SQS.
+

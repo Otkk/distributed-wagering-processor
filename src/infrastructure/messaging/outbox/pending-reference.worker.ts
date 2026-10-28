@@ -3,6 +3,7 @@ import {
   Injectable,
   OnApplicationShutdown,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
 import { ProcessWagerTransactionUseCase } from '../../../application/use-cases/process-wager-transaction.use-case';
@@ -51,6 +52,8 @@ export class PendingReferenceWorker implements OnModuleInit, OnApplicationShutdo
     private readonly processWagerUseCase: ProcessWagerTransactionUseCase,
     private readonly logger: AppLoggerService,
     private readonly metrics: MetricsService,
+    @Optional()
+    @Inject('PENDING_REF_OPTIONS')
     options?: {
       pollIntervalMs?: number;
       maxAttempts?: number;

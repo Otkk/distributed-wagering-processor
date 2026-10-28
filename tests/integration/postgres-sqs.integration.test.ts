@@ -26,23 +26,8 @@ import { MikroOrmWalletLedgerRepository } from '../../src/infrastructure/databas
 import { MikroOrmWalletRepository } from '../../src/infrastructure/database/repositories/mikro-orm-wallet.repository';
 import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs/sqs-event-publisher';
 import { AwsSqsConsumerClient } from '../../src/infrastructure/messaging/sqs/wager-transaction.consumer';
+import { ensureRealPostgres } from '../helpers/real-infra.helper';
 
-async function isPortOpen(host: string, port: number, timeoutMs = 400): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    const onError = () => {
-      socket.destroy();
-      resolve(false);
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once('error', onError);
-    socket.once('timeout', onError);
-    socket.connect(port, host, () => {
-      socket.end();
-      resolve(true);
-    });
-  });
-}
 
 describe('Integration Suite: Migrations, MikroORM Repositories, Atomic Rollback & SQS Adapters', () => {
   describe('1. Reversible SQL Migration & Relational Constraints Verification', () => {
@@ -554,36 +539,12 @@ describe('Integration Suite: Migrations, MikroORM Repositories, Atomic Rollback 
     });
   });
 
-  describe('3. Live PostgreSQL 16 & LocalStack SQS Container Verification (Automatic when Docker Compose is up)', () => {
-    it('deve executar migrations, constraints (CHECK/UNIQUE), triggers append-only, atomicidade, outbox SKIP LOCKED e concorrência no PostgreSQL 16 real', async () => {
-      const dbHost = process.env.DB_HOST || 'localhost';
-      const dbPort = Number(process.env.DB_PORT) || 5432;
-      const pgAvailable = await isPortOpen(dbHost, dbPort);
-
-      if (!pgAvailable) {
-        expect(mikroOrmConfig.dbName).toBeDefined();
-        expect(mikroOrmConfig.entities?.length).toBe(5);
-        return;
-      }
-
-      let orm: MikroORM | undefined;
-      try {
-        orm = await MikroORM.init(mikroOrmConfig);
-        await orm.em.getConnection().execute('SELECT 1');
-      } catch (err) {
-        if (process.env.REQUIRE_INFRA === 'true') {
-          throw err;
-        }
-        // Porta 5432 ocupada por instância local fora do Docker Compose (credenciais diferentes de postgres/wagering_db)
-        expect(mikroOrmConfig.dbName).toBeDefined();
-        expect(mikroOrmConfig.entities?.length).toBe(5);
-        if (orm) await orm.close(true).catch(() => {});
-        return;
-      }
+  describe('3. Live PostgreSQL Relational & Concurrency Verification', () => {
+    it('deve executar migrations, constraints (CHECK/UNIQUE), triggers append-only, atomicidade, outbox SKIP LOCKED e concorrência no PostgreSQL real', async () => {
+      const { orm } = await ensureRealPostgres();
 
       try {
-        await orm.getMigrator().up();
-        const em = orm.em.fork();
+        const em = orm.em;
 
         const walletRepo = new MikroOrmWalletRepository(em);
         const txRepo = new MikroOrmWagerTransactionRepository(em);

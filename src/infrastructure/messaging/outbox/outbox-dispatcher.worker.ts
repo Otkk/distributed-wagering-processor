@@ -24,6 +24,7 @@ export class OutboxDispatcherWorker implements OnModuleInit, OnApplicationShutdo
   private activeBatchPromise: Promise<OutboxBatchResult> | null = null;
   private readonly pollIntervalMs: number;
   private readonly batchSize: number;
+  private readonly leaseDurationMs: number;
 
   constructor(
     @Inject('OutboxRepository') private readonly outboxRepo: OutboxRepository,
@@ -34,6 +35,7 @@ export class OutboxDispatcherWorker implements OnModuleInit, OnApplicationShutdo
   ) {
     this.pollIntervalMs = Number(process.env.OUTBOX_POLL_INTERVAL_MS) || 1000;
     this.batchSize = Number(process.env.OUTBOX_BATCH_SIZE) || 50;
+    this.leaseDurationMs = Number(process.env.OUTBOX_LEASE_DURATION_MS) || 30000;
   }
 
   public onModuleInit(): void {
@@ -66,6 +68,12 @@ export class OutboxDispatcherWorker implements OnModuleInit, OnApplicationShutdo
     }
   }
 
+  /**
+   * Padrão Claim-Publish-Confirm:
+   * 1. Fase Claim (transação SQL curta): seleciona com FOR UPDATE SKIP LOCKED e aplica lease curto (nextAttemptAt = now + 30s).
+   * 2. Fase Publish (fora de transação SQL): publica no AWS SQS sem segurar conexões ou locks no PostgreSQL.
+   * 3. Fase Confirm (transação SQL curta): grava publishedAt (sucesso) ou scheduleRetry com backoff exponencial (erro).
+   */
   public async dispatchBatch(
     customBatchSize?: number,
     customNow?: Date,
@@ -75,39 +83,50 @@ export class OutboxDispatcherWorker implements OnModuleInit, OnApplicationShutdo
     let published = 0;
     let failed = 0;
 
-    await this.uow.transactional(async () => {
+    // Fase 1: Claim curto sob FOR UPDATE SKIP LOCKED
+    const claimedMessages = await this.uow.transactional(async () => {
       const pendingMessages = await this.outboxRepo.findPendingToDispatch(limit, now);
-
       for (const message of pendingMessages) {
-        if (this.isShuttingDown) {
-          break;
-        }
-
-        const lagMs = Math.max(0, now.getTime() - message.occurredAt.getTime());
-        this.metrics.setOutboxLag(lagMs);
-
-        try {
-          await this.publisher.publish(message);
-          message.markPublished(new Date());
-          await this.outboxRepo.save(message);
-          published += 1;
-        } catch (err) {
-          message.scheduleRetry(now);
-          await this.outboxRepo.save(message);
-          this.metrics.incrementRetry();
-          failed += 1;
-
-          this.logger.warn(`Failed to publish outbox event ${message.id}, scheduled retry`, {
-            outboxId: message.id,
-            aggregateId: message.aggregateId,
-            eventType: message.eventType,
-            attempts: message.attempts,
-            nextAttemptAt: message.nextAttemptAt?.toISOString(),
-            error: (err as Error).message,
-          });
-        }
+        message.claimLease(now, this.leaseDurationMs);
+        await this.outboxRepo.save(message);
       }
+      return pendingMessages;
     });
+
+    // Fase 2 & 3: Publicação na rede (fora de transação) e confirmação individual
+    for (const message of claimedMessages) {
+      if (this.isShuttingDown) {
+        break;
+      }
+
+      const lagMs = Math.max(0, now.getTime() - message.occurredAt.getTime());
+      this.metrics.setOutboxLag(lagMs);
+
+      try {
+        await this.publisher.publish(message);
+        message.markPublished(new Date());
+        await this.uow.transactional(async () => {
+          await this.outboxRepo.save(message);
+        });
+        published += 1;
+      } catch (err) {
+        message.scheduleRetry(now);
+        await this.uow.transactional(async () => {
+          await this.outboxRepo.save(message);
+        });
+        this.metrics.incrementRetry();
+        failed += 1;
+
+        this.logger.warn(`Failed to publish outbox event ${message.id}, scheduled retry`, {
+          outboxId: message.id,
+          aggregateId: message.aggregateId,
+          eventType: message.eventType,
+          attempts: message.attempts,
+          nextAttemptAt: message.nextAttemptAt?.toISOString(),
+          error: (err as Error).message,
+        });
+      }
+    }
 
     return { published, failed };
   }

@@ -36,6 +36,10 @@ import { MetricsService } from './infrastructure/metrics/metrics.service';
     AuthGuard,
     NoopProviderIdentityPort,
     {
+      provide: 'ProviderIdentityPort',
+      useExisting: NoopProviderIdentityPort,
+    },
+    {
       provide: 'EventPublisherPort',
       useClass: SqsEventPublisher,
     },

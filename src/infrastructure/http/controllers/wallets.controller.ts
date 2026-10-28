@@ -84,4 +84,10 @@ export class WalletsController {
   async reconcileWallet(@Param('walletId') walletId: string) {
     return this.reconcileWalletUseCase.execute(walletId);
   }
+
+  @Get(':walletId/reconcile')
+  async reconcileWalletGet(@Param('walletId') walletId: string) {
+    return this.reconcileWalletUseCase.execute(walletId);
+  }
 }
+

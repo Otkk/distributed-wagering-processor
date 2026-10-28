@@ -756,26 +756,37 @@ Teste de carga também conta como diferencial. Se fizer, exponha como `bun run t
 ### 15.1 Pré-requisitos
 
 - **Bun** `>= 1.1` (testado com `Bun 1.4.4`)
-- **Docker & Docker Compose** (para subir `PostgreSQL 16` e `LocalStack SQS`)
+- **Docker & Docker Compose** (para subir a stack completa `PostgreSQL 16` + `LocalStack SQS` + `App`)
 
-### 15.2 Setup Inicial
+### 15.2 Opção A — Subindo Tudo com Um Único Comando (Docker Compose Completo)
+
+O arquivo [`docker-compose.yml`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/docker-compose.yml) e o [`Dockerfile`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/Dockerfile) orquestram os 3 serviços (`postgres`, `localstack` com criação automática das filas FIFO e `app` com `AUTO_MIGRATE=true`):
+
+```bash
+docker compose up -d --build
+```
+
+- A API estará disponível em `http://localhost:3000` (healthchecks em `/health/live`, `/health/ready` e `/health/metrics`).
+- Caso a porta `5432` já esteja ocupada por um PostgreSQL local no host, basta definir `DB_PORT=5433` no `.env` antes de executar `docker compose up -d --build`.
+
+### 15.3 Opção B — Desenvolvimento Local (Host Bun + Infra em Containers)
 
 1. Instale as dependências:
    ```bash
    bun install
    ```
 
-2. Configure as variáveis de ambiente (o arquivo `.env` já acompanha valores padrão prontos para o Docker Compose local):
+2. Configure as variáveis de ambiente:
    ```bash
    cp .env.example .env
    ```
 
-3. Suba a infraestrutura local (`PostgreSQL 16` na porta `5432` e `LocalStack SQS` na porta `4566` com provisionamento automático das filas FIFO `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `wagering-events.fifo` via `scripts/localstack-init.sh`):
+3. Suba apenas a infraestrutura (`postgres` e `localstack`):
    ```bash
-   docker compose up -d
+   docker compose up -d postgres localstack
    ```
 
-4. Execute as migrations versionadas no PostgreSQL:
+4. Execute as migrations reversíveis no PostgreSQL:
    ```bash
    bun run migration:up
    ```
@@ -792,20 +803,21 @@ Teste de carga também conta como diferencial. Se fizer, exponha como `bun run t
 
 ---
 
-### 15.3 Comandos de Testes e Verificação
+### 15.4 Comandos de Testes e Verificação
 
 | Comando | Descrição |
 |---|---|
 | `bun run test` | Executa a suíte de **testes de unidade** (`Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `CanonicalHash`, `UseCases`, `Controllers`, `PrematureFailures`) |
-| `bun run test:integration` | Executa a suíte de **testes de integração** (migrations `up`/`down`, constraints SQL, triggers append-only, repositórios MikroORM, rollback atômico e adaptadores SQS) |
-| `bun run test:concurrency` | Executa a suíte de **testes de concorrência real e resiliência** (50x idempotência em paralelo, disputa de saldo em *hot wallet*, 20 carteiras paralelas, 4 instâncias simultâneas, `SIGTERM` devolvendo visibilidade, worker crash pós-commit e resolução de `PENDING_REFERENCE`) |
-| `bun run test:all` | Executa **todas as 91 especificações de teste** (`unit` + `integration` + `concurrency`) |
-| `bun run test:load` | Executa o **experimento automatizado de carga e estresse** (Perfil A Multi-Wallet vs Perfil B Hot Wallet 50x) com auditoria contábil final (`wallet.balance == sum(ledger)`) |
+| `bun run test:integration` | Executa a suíte de **testes de integração** (migrations `up`/`down` reais no PostgreSQL, constraints SQL, triggers append-only, repositórios MikroORM com `TransactionContext`, rollback atômico e adaptadores SQS) |
+| `bun run test:concurrency` | Executa a suíte de **testes de concorrência e resiliência** (50x idempotência em paralelo, disputa de saldo em *hot wallet*, 20 carteiras paralelas, 4 instâncias simultâneas, `SIGTERM` devolvendo visibilidade, worker crash pós-commit e resolução de `PENDING_REFERENCE`) |
+| `bun run test:e2e` | Executa a suíte **End-to-End (E2E) real** subindo o servidor HTTP NestJS completo + PostgreSQL real (`SELECT ... FOR UPDATE`) + `@aws-sdk/client-sqs` via HTTP (incluindo 20 apostas HTTP simultâneas na mesma carteira) |
+| `bun run test:all` | Executa **todas as 96 especificações de teste** (`unit` + `integration` + `concurrency` + `e2e`) |
+| `bun run test:load` | Executa o **benchmark real de carga (`HTTP` + `PostgreSQL` + `SQS` + `autocannon`)** avaliando escrita paralela multi-carteira, rajadas concorrentes em *hot wallet* e leitura via `autocannon`, com reconciliação contábil final (`wallet.balance == sum(ledger)`) |
 | `bun x tsc --noEmit` | Validação estrita de tipos do TypeScript (`strict: true`) |
 
 ---
 
-### 15.4 Estrutura do Projeto
+### 15.5 Estrutura do Projeto
 
 ```text
 ├── src/
@@ -814,26 +826,32 @@ Teste de carga também conta como diferencial. Se fizer, exponha como `bun run t
 │   │   ├── events/              # IntegrationEvent<T> e eventos de domínio/integração
 │   │   ├── models/              # Money (decimal.js), Wallet, WagerTransaction, WalletLedgerEntry, Inbox, Outbox
 │   │   └── ports/               # Interfaces de repositórios e UnitOfWork
-│   ├── application/             # Casos de uso transacionais ACID
+│   ├── application/             # Casos de uso transacionais ACID e políticas de domínio
 │   │   ├── dto/                 # Contratos de entrada/saída da camada de aplicação
+│   │   ├── policies/            # Validação de referências, hash canônico e fábricas de eventos Outbox
 │   │   └── use-cases/           # CreateWallet, ProcessWagerTransaction, ReconcileWallet, GetWalletLedger
 │   ├── infrastructure/          # Adaptadores HTTP, Persistência PostgreSQL/MikroORM, SQS e Telemetria
-│   │   ├── database/            # Entities MikroORM, Migrations reversíveis, Repositórios e UnitOfWork
+│   │   ├── database/            # Entities MikroORM, Migrations reversíveis, Repositórios (TransactionContext) e UnitOfWork
 │   │   ├── http/                # Controllers REST, DTOs validados, ExceptionFilter, AuthGuard, CorrelationId
 │   │   ├── logger/              # Logger estruturado JSON (Pino) sem vazamento de dados sensíveis
-│   │   ├── messaging/           # WagerTransactionConsumer (SQS), OutboxDispatcherWorker, PendingReferenceWorker
+│   │   ├── messaging/           # WagerTransactionConsumer (SQS), OutboxDispatcherWorker (Claim-Publish-Confirm), PendingReferenceWorker
 │   │   └── metrics/             # Coleta de métricas operacionais, latência (p50/p95/p99) e outbox lag
 │   ├── app.module.ts
 │   └── main.ts
 ├── tests/
 │   ├── unit/                    # Testes unitários de domínio, casos de uso, controllers e armadilhas eliminatórias
-│   ├── integration/             # Testes de integração de migrations, repositórios, atomicidade e containers
-│   ├── concurrency/             # Cenários obrigatórios das Seções 8 e 13 (paralelismo real e multi-instância)
-│   └── load/                    # Script de benchmark e teste de carga (bun run test:load)
+│   ├── integration/             # Testes de integração de migrations, repositórios e PostgreSQL real
+│   ├── concurrency/             # Cenários obrigatórios das Seções 8 e 13 (paralelismo e multi-instância)
+│   ├── e2e/                     # Testes End-to-End reais (HTTP NestJS + PostgreSQL + AWS SQS SDK)
+│   ├── helpers/                 # Provisionamento automático de PostgreSQL e servidor HTTP SQS para testes
+│   └── load/                    # Benchmark real HTTP + PostgreSQL + autocannon (bun run test:load)
 ├── scripts/
-│   └── localstack-init.sh       # Criação automática das filas SQS FIFO e DLQ no LocalStack
-├── docker-compose.yml
-├── ARCHITECTURE.md              # Decisões arquiteturais, justificativa do ORM, trade-offs e relatório de carga
+│   ├── localstack-init.sh       # Criação automática das filas SQS FIFO e DLQ no LocalStack
+│   └── migrate.ts               # Executor programático de migrations (up, down, fresh)
+├── Dockerfile                   # Imagem de produção Bun Alpine com healthcheck e SIGTERM
+├── docker-compose.yml           # Orquestração completa: postgres + localstack + app
+├── ARCHITECTURE.md              # Decisões arquiteturais, justificativa do ORM, trade-offs e relatório de carga real
 └── README.md
 ```
+
 

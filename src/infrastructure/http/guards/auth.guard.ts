@@ -1,4 +1,4 @@
-import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
+import { CanActivate, ExecutionContext, Inject, Injectable, Optional } from '@nestjs/common';
 import type { Request } from 'express';
 
 export interface ProviderIdentityPort {
@@ -15,7 +15,11 @@ export class NoopProviderIdentityPort implements ProviderIdentityPort {
 
 @Injectable()
 export class AuthGuard implements CanActivate {
-  constructor(private readonly identityPort?: ProviderIdentityPort) {}
+  constructor(
+    @Optional()
+    @Inject('ProviderIdentityPort')
+    private readonly identityPort?: ProviderIdentityPort,
+  ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<Request>();

@@ -3,6 +3,7 @@ import {
   Injectable,
   OnApplicationShutdown,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import {
   ChangeMessageVisibilityCommand,
@@ -77,7 +78,7 @@ export interface SqsConsumerClientPort {
 export class AwsSqsConsumerClient implements SqsConsumerClientPort {
   private readonly client: SQSClient;
 
-  constructor(client?: SQSClient) {
+  constructor(@Optional() @Inject('SQS_CLIENT') client?: SQSClient) {
     this.client =
       client ??
       new SQSClient({
@@ -178,6 +179,8 @@ export class WagerTransactionConsumer implements OnModuleInit, OnApplicationShut
     private readonly sqsClient: SqsConsumerClientPort,
     private readonly logger: AppLoggerService,
     private readonly metrics: MetricsService,
+    @Optional()
+    @Inject('WAGER_CONSUMER_OPTIONS')
     options?: {
       queueUrl?: string;
       dlqUrl?: string;
@@ -187,11 +190,13 @@ export class WagerTransactionConsumer implements OnModuleInit, OnApplicationShut
   ) {
     this.queueUrl =
       options?.queueUrl ??
-      (process.env.SQS_INGESTION_QUEUE_URL ||
+      (process.env.SQS_WAGER_QUEUE_URL ||
+        process.env.SQS_INGESTION_QUEUE_URL ||
         'http://localhost:4566/000000000000/wager-transactions.fifo');
     this.dlqUrl =
       options?.dlqUrl ??
-      (process.env.SQS_DLQ_QUEUE_URL ||
+      (process.env.SQS_WAGER_DLQ_URL ||
+        process.env.SQS_DLQ_QUEUE_URL ||
         'http://localhost:4566/000000000000/wager-transactions-dlq.fifo');
     this.maxReceiveCount = options?.maxReceiveCount ?? 5;
     this.shutdownTimeoutMs = options?.shutdownTimeoutMs ?? 5000;

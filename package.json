@@ -13,12 +13,13 @@
     "test": "bun test tests/unit",
     "test:integration": "bun test tests/integration",
     "test:concurrency": "bun test tests/concurrency",
+    "test:e2e": "bun test tests/e2e",
     "test:all": "bun test",
     "test:load": "bun run tests/load/load-test.ts",
     "migration:create": "bun mikro-orm migration:create",
-    "migration:up": "bun mikro-orm migration:up",
-    "migration:down": "bun mikro-orm migration:down",
-    "migration:fresh": "bun mikro-orm migration:fresh"
+    "migration:up": "bun run scripts/migrate.ts up",
+    "migration:down": "bun run scripts/migrate.ts down",
+    "migration:fresh": "bun run scripts/migrate.ts fresh"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.670.0",
