@@ -39,7 +39,13 @@ export class WalletNotFoundError extends DomainError {
   }
 }
 
+export interface WagerProcessingObserverPort {
+  onLockConflict?(walletId: string): void;
+}
+
 export class ProcessWagerTransactionUseCase {
+  private static readonly activeWalletLocks = new Map<string, number>();
+
   constructor(
     private readonly walletRepo: WalletRepository,
     private readonly txRepo: WagerTransactionRepository,
@@ -47,6 +53,7 @@ export class ProcessWagerTransactionUseCase {
     private readonly outboxRepo: OutboxRepository,
     private readonly inboxRepo: InboxRepository,
     private readonly uow: UnitOfWork,
+    private readonly observer?: WagerProcessingObserverPort,
   ) {}
 
   public async execute(input: ProcessWagerInput): Promise<ProcessWagerOutput> {
@@ -57,21 +64,29 @@ export class ProcessWagerTransactionUseCase {
     const money = Money.from(input.money);
     const payloadHash = computeWagerPayloadHash(input, money);
 
-    return this.uow.transactional(async () => {
-      const msgId = input.messageId ?? input.inboxContext?.messageId;
-      const consName = input.consumerName ?? input.inboxContext?.consumerName;
+    const currentHolders =
+      ProcessWagerTransactionUseCase.activeWalletLocks.get(input.walletId) ?? 0;
+    if (currentHolders > 0) {
+      this.observer?.onLockConflict?.(input.walletId);
+    }
+    ProcessWagerTransactionUseCase.activeWalletLocks.set(input.walletId, currentHolders + 1);
 
-      // 1. Concorrência: Pessimistic Lock na Wallet (Unidade de concorrência é a walletId)
-      const wallet = await this.walletRepo.findById(input.walletId, 'pessimistic_write');
-      if (!wallet) {
-        throw new WalletNotFoundError(input.walletId);
-      }
-      if (wallet.playerId !== input.playerId) {
-        throw new DomainError(`Player ${input.playerId} does not own wallet ${input.walletId}`);
-      }
-      if (wallet.currency !== money.currency) {
-        throw new CurrencyMismatchError(wallet.currency, money.currency);
-      }
+    try {
+      return await this.uow.transactional(async () => {
+        const msgId = input.messageId ?? input.inboxContext?.messageId;
+        const consName = input.consumerName ?? input.inboxContext?.consumerName;
+
+        // 1. Concorrência: Pessimistic Lock na Wallet (Unidade de concorrência é a walletId)
+        const wallet = await this.walletRepo.findById(input.walletId, 'pessimistic_write');
+        if (!wallet) {
+          throw new WalletNotFoundError(input.walletId);
+        }
+        if (wallet.playerId !== input.playerId) {
+          throw new DomainError(`Player ${input.playerId} does not own wallet ${input.walletId}`);
+        }
+        if (wallet.currency !== money.currency) {
+          throw new CurrencyMismatchError(wallet.currency, money.currency);
+        }
 
       // 2. Deduplicação de fila (Persistent Inbox) sob o lock da carteira
       if (msgId && consName) {
@@ -279,7 +294,16 @@ export class ProcessWagerTransactionUseCase {
         balance: wallet.balance.toJSON(),
         idempotentReplay: false,
       };
-    });
+      });
+    } finally {
+      const remaining =
+        (ProcessWagerTransactionUseCase.activeWalletLocks.get(input.walletId) ?? 1) - 1;
+      if (remaining <= 0) {
+        ProcessWagerTransactionUseCase.activeWalletLocks.delete(input.walletId);
+      } else {
+        ProcessWagerTransactionUseCase.activeWalletLocks.set(input.walletId, remaining);
+      }
+    }
   }
 
   private async applyLedgerMovement(

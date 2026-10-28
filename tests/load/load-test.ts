@@ -7,7 +7,7 @@ import { WagerTransactionKind } from '../../src/domain/models/wager-transaction'
 import { GlobalHttpExceptionFilter } from '../../src/infrastructure/http/filters/http-exception.filter';
 import { AppLoggerService } from '../../src/infrastructure/logger/app-logger.service';
 import { OutboxDispatcherWorker } from '../../src/infrastructure/messaging/outbox/outbox-dispatcher.worker';
-import { ensureRealPostgres, LocalSqsHttpServer } from '../helpers/real-infra.helper';
+import { ensureRealPostgres, ensureSqsEndpoint } from '../helpers/real-infra.helper';
 
 interface AutocannonResult {
   requests: { average: number; total: number };
@@ -80,9 +80,9 @@ async function runLoadTest() {
 
   console.log(`Database       : ${pgVersion} (port ${dbPort}, real SELECT ... FOR UPDATE)`);
 
-  // 2. Sobe servidor HTTP SQS real
-  const sqsServer = new LocalSqsHttpServer(5);
-  const sqsEndpoint = await sqsServer.start(0);
+  // 2. Conecta ao LocalStack real (se ativo) ou sobe servidor HTTP SQS real
+  const sqsHandle = await ensureSqsEndpoint();
+  const sqsEndpoint = sqsHandle.endpoint;
 
   process.env.DB_PORT = String(dbPort);
   process.env.DISABLE_WORKERS = 'true';
@@ -91,7 +91,8 @@ async function runLoadTest() {
   process.env.AWS_ENDPOINT = sqsEndpoint;
   process.env.SQS_WAGER_QUEUE_URL = `${sqsEndpoint}/000000000000/wager-transactions.fifo`;
   process.env.SQS_WAGER_DLQ_URL = `${sqsEndpoint}/000000000000/wager-transactions-dlq.fifo`;
-  process.env.SQS_OUTBOX_QUEUE_URL = `${sqsEndpoint}/000000000000/wager-transactions.fifo`;
+  process.env.SQS_OUTBOX_QUEUE_URL = `${sqsEndpoint}/000000000000/wagering-events.fifo`;
+  process.env.SQS_EVENTS_QUEUE_URL = `${sqsEndpoint}/000000000000/wagering-events.fifo`;
 
   // 3. Sobe aplicação NestJS real escutando em porta TCP real
   const app: INestApplication = await NestFactory.create(AppModule, { logger: false });
@@ -369,7 +370,7 @@ async function runLoadTest() {
     console.log('================================================================================');
   } finally {
     await app.close();
-    await sqsServer.stop();
+    await sqsHandle.stop();
   }
 }
 

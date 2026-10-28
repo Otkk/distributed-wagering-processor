@@ -23,7 +23,7 @@ export class AuthGuard implements CanActivate {
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<Request>();
-    const path = request.path;
+    const path = request.path || request.url || '';
 
     // Endpoints de health são explicitamente abertos
     if (path.startsWith('/health')) {

@@ -4,6 +4,12 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
+import {
+  CreateQueueCommand,
+  ListQueuesCommand,
+  PurgeQueueCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/postgresql';
 import mikroOrmConfig from '../../src/infrastructure/database/mikro-orm.config';
 
@@ -35,11 +41,13 @@ export class LocalSqsHttpServer {
     this.maxReceiveCount = maxReceiveCount;
     this.queues.set('wager-transactions.fifo', []);
     this.queues.set('wager-transactions-dlq.fifo', []);
+    this.queues.set('wagering-events.fifo', []);
   }
 
   public reset(): void {
     this.queues.set('wager-transactions.fifo', []);
     this.queues.set('wager-transactions-dlq.fifo', []);
+    this.queues.set('wagering-events.fifo', []);
     this.dedupCache.clear();
   }
 
@@ -247,10 +255,122 @@ export class LocalSqsHttpServer {
         return {};
       }
 
+      case 'PurgeQueue': {
+        const queueName = this.resolveQueueName(String(body.QueueUrl || ''));
+        this.queues.set(queueName, []);
+        return {};
+      }
+
       default:
         return {};
     }
   }
+}
+
+export interface SqsEndpointHandle {
+  endpoint: string;
+  isExternalContainer: boolean;
+  localServer?: LocalSqsHttpServer;
+  stop: () => Promise<void>;
+}
+
+async function isTcpPortOpen(host: string, port: number, timeoutMs = 800): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (!settled) {
+        settled = true;
+        socket.destroy();
+        resolve(ok);
+      }
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    socket.connect(port, host);
+  });
+}
+
+/**
+ * Conecta ao container LocalStack real na porta 4566 se estiver rodando (garantindo as 3 filas FIFO),
+ * ou sobe o LocalSqsHttpServer em porta efêmera caso o container não esteja ativo.
+ * Se REQUIRE_INFRA=true ou REQUIRE_LOCALSTACK=true, exige obrigatoriamente o container LocalStack.
+ */
+export async function ensureSqsEndpoint(): Promise<SqsEndpointHandle> {
+  const candidateEndpoint = process.env.AWS_ENDPOINT || 'http://localhost:4566';
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(candidateEndpoint);
+  } catch {
+    parsedUrl = new URL('http://localhost:4566');
+  }
+
+  const host = parsedUrl.hostname || 'localhost';
+  const port = Number(parsedUrl.port || 4566);
+
+  if (await isTcpPortOpen(host, port)) {
+    const client = new SQSClient({
+      region: process.env.AWS_REGION || 'us-east-1',
+      endpoint: candidateEndpoint,
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || 'test',
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || 'test',
+      },
+    });
+
+    try {
+      await client.send(new ListQueuesCommand({}));
+      for (const queueName of [
+        'wager-transactions-dlq.fifo',
+        'wager-transactions.fifo',
+        'wagering-events.fifo',
+      ]) {
+        await client.send(
+          new CreateQueueCommand({
+            QueueName: queueName,
+            Attributes: {
+              FifoQueue: 'true',
+              ContentBasedDeduplication: 'true',
+            },
+          }),
+        );
+        try {
+          await client.send(
+            new PurgeQueueCommand({
+              QueueUrl: `${candidateEndpoint}/000000000000/${queueName}`,
+            }),
+          );
+        } catch {
+          // PurgeQueue pode ter cooldown em alguns brokers; ignorar se não suportado
+        }
+      }
+
+      return {
+        endpoint: candidateEndpoint,
+        isExternalContainer: true,
+        stop: async () => {},
+      };
+    } catch {
+      // Se falhar o handshake SQS, verifica se o container era obrigatório
+    }
+  }
+
+  if (process.env.REQUIRE_INFRA === 'true' || process.env.REQUIRE_LOCALSTACK === 'true') {
+    throw new Error(
+      `LocalStack SQS container is required (REQUIRE_INFRA=true) but not reachable at ${candidateEndpoint}. Run 'docker compose up -d'.`,
+    );
+  }
+
+  const localServer = new LocalSqsHttpServer(5);
+  const endpoint = await localServer.start(0);
+  return {
+    endpoint,
+    isExternalContainer: false,
+    localServer,
+    stop: () => localServer.stop(),
+  };
 }
 
 async function canConnectToPostgres(port: number): Promise<boolean> {
@@ -299,9 +419,10 @@ function findLocalPostgresBinDir(): string | null {
  */
 export async function ensureRealPostgres(): Promise<{ port: number; orm: MikroORM }> {
   const configuredPort = Number(process.env.DB_PORT);
-  const candidatePorts = Array.from(
-    new Set([5433, configuredPort || 5432, 5432]),
-  );
+  const candidatePorts =
+    process.env.REQUIRE_INFRA === 'true'
+      ? Array.from(new Set([configuredPort || 5432, 5432, 5433]))
+      : Array.from(new Set([5433, configuredPort || 5432, 5432]));
 
   for (const port of candidatePorts) {
     if (await canConnectToPostgres(port)) {
@@ -313,6 +434,12 @@ export async function ensureRealPostgres(): Promise<{ port: number; orm: MikroOR
       await orm.getMigrator().up();
       return { port, orm };
     }
+  }
+
+  if (process.env.REQUIRE_INFRA === 'true') {
+    throw new Error(
+      `PostgreSQL container is required (REQUIRE_INFRA=true) but not reachable on ports ${candidatePorts.join(', ')}. Run 'docker compose up -d'.`,
+    );
   }
 
   // Fallback: se os binários locais do PostgreSQL existirem, sobe na porta 5433

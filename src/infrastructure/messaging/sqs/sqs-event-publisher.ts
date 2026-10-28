@@ -30,7 +30,7 @@ export class SqsEventPublisher implements EventPublisherPort {
       eventsQueueUrl ??
       (process.env.SQS_OUTBOX_QUEUE_URL ||
         process.env.SQS_EVENTS_QUEUE_URL ||
-        'http://localhost:4566/000000000000/wager-transactions.fifo');
+        'http://localhost:4566/000000000000/wagering-events.fifo');
   }
 
   public async publish(outboxMessage: OutboxMessage): Promise<void> {

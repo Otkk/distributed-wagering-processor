@@ -760,7 +760,10 @@ Teste de carga também conta como diferencial. Se fizer, exponha como `bun run t
 
 ### 15.2 Opção A — Subindo Tudo com Um Único Comando (Docker Compose Completo)
 
-O arquivo [`docker-compose.yml`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/docker-compose.yml) e o [`Dockerfile`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/Dockerfile) orquestram os 3 serviços (`postgres`, `localstack` com criação automática das filas FIFO e `app` com `AUTO_MIGRATE=true`):
+O arquivo [`docker-compose.yml`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/docker-compose.yml) e o [`Dockerfile`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/Dockerfile) orquestram os 3 serviços:
+- `postgres` (`postgres:16-alpine` com healthcheck `pg_isready`);
+- `localstack` (`localstack/localstack:3.7` executando [`scripts/localstack-init.sh`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/scripts/localstack-init.sh) para provisionar automaticamente as 3 filas FIFO: `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `wagering-events.fifo`);
+- `app` (imagem Bun Alpine com `AUTO_MIGRATE=true` e healthcheck em `/health/live`):
 
 ```bash
 docker compose up -d --build
@@ -805,13 +808,19 @@ docker compose up -d --build
 
 ### 15.4 Comandos de Testes e Verificação
 
+> 💡 **Detecção Automática de Containers (`ensureRealPostgres` & `ensureSqsEndpoint`)**:
+> Os testes de integração, concorrência, E2E e carga detectam automaticamente se o PostgreSQL (`5432`/`5433`) e o container LocalStack (`http://localhost:4566`) estão ativos. Para **exigir estritamente os containers Docker** (falhando imediatamente caso o `postgres` ou `localstack` não estejam rodando via Docker Compose), execute com `REQUIRE_INFRA=true`:
+> ```bash
+> REQUIRE_INFRA=true bun run test:all
+> ```
+
 | Comando | Descrição |
 |---|---|
 | `bun run test` | Executa a suíte de **testes de unidade** (`Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `CanonicalHash`, `UseCases`, `Controllers`, `PrematureFailures`) |
 | `bun run test:integration` | Executa a suíte de **testes de integração** (migrations `up`/`down` reais no PostgreSQL, constraints SQL, triggers append-only, repositórios MikroORM com `TransactionContext`, rollback atômico e adaptadores SQS) |
-| `bun run test:concurrency` | Executa a suíte de **testes de concorrência e resiliência** (50x idempotência em paralelo, disputa de saldo em *hot wallet*, 20 carteiras paralelas, 4 instâncias simultâneas, `SIGTERM` devolvendo visibilidade, worker crash pós-commit e resolução de `PENDING_REFERENCE`) |
-| `bun run test:e2e` | Executa a suíte **End-to-End (E2E) real** subindo o servidor HTTP NestJS completo + PostgreSQL real (`SELECT ... FOR UPDATE`) + `@aws-sdk/client-sqs` via HTTP (incluindo 20 apostas HTTP simultâneas na mesma carteira) |
-| `bun run test:all` | Executa **todas as 96 especificações de teste** (`unit` + `integration` + `concurrency` + `e2e`) |
+| `bun run test:concurrency` | Executa a suíte de **testes de concorrência e resiliência** — incluindo [`real-postgres-concurrency.test.ts`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/tests/concurrency/real-postgres-concurrency.test.ts), que valida **todos os 8 cenários obrigatórios da Seção 13 diretamente sobre o PostgreSQL real** (50x idempotência em paralelo, disputa de saldo em *hot wallet*, 10 carteiras paralelas, 3 instâncias `MikroORM` simultâneas, worker crash pós-commit deduplicado via `inbox_messages`, 2 publishers concorrentes em `outbox_messages` com `FOR UPDATE SKIP LOCKED`, `ROLLBACK`/`REFUND` fora de ordem e recuperação pós-restart) |
+| `bun run test:e2e` | Executa a suíte **End-to-End (E2E) real** subindo o servidor HTTP NestJS completo + PostgreSQL real (`SELECT ... FOR UPDATE`) + `@aws-sdk/client-sqs` via HTTP (incluindo publicação Outbox em `wagering-events.fifo`, consumo FIFO em `wager-transactions.fifo`, 20 apostas simultâneas na mesma carteira e detecção de divergência contábil) |
+| `bun run test:all` | Executa **todas as 105 especificações de teste** (`unit` + `integration` + `concurrency` + `e2e`) |
 | `bun run test:load` | Executa o **benchmark real de carga (`HTTP` + `PostgreSQL` + `SQS` + `autocannon`)** avaliando escrita paralela multi-carteira, rajadas concorrentes em *hot wallet* e leitura via `autocannon`, com reconciliação contábil final (`wallet.balance == sum(ledger)`) |
 | `bun x tsc --noEmit` | Validação estrita de tipos do TypeScript (`strict: true`) |
 
@@ -832,21 +841,21 @@ docker compose up -d --build
 │   │   └── use-cases/           # CreateWallet, ProcessWagerTransaction, ReconcileWallet, GetWalletLedger
 │   ├── infrastructure/          # Adaptadores HTTP, Persistência PostgreSQL/MikroORM, SQS e Telemetria
 │   │   ├── database/            # Entities MikroORM, Migrations reversíveis, Repositórios (TransactionContext) e UnitOfWork
-│   │   ├── http/                # Controllers REST, DTOs validados, ExceptionFilter, AuthGuard, CorrelationId
+│   │   ├── http/                # Controllers REST, DTOs validados, ExceptionFilter, AuthGuard (APP_GUARD), CorrelationId
 │   │   ├── logger/              # Logger estruturado JSON (Pino) sem vazamento de dados sensíveis
 │   │   ├── messaging/           # WagerTransactionConsumer (SQS), OutboxDispatcherWorker (Claim-Publish-Confirm), PendingReferenceWorker
-│   │   └── metrics/             # Coleta de métricas operacionais, latência (p50/p95/p99) e outbox lag
+│   │   └── metrics/             # Coleta de métricas operacionais (status, replays, retries, DLQ, lockConflicts, divergences, outboxLag, p50/p95/p99)
 │   ├── app.module.ts
 │   └── main.ts
 ├── tests/
 │   ├── unit/                    # Testes unitários de domínio, casos de uso, controllers e armadilhas eliminatórias
 │   ├── integration/             # Testes de integração de migrations, repositórios e PostgreSQL real
-│   ├── concurrency/             # Cenários obrigatórios das Seções 8 e 13 (paralelismo e multi-instância)
+│   ├── concurrency/             # Cenários obrigatórios das Seções 8 e 13 (em memória e no PostgreSQL real)
 │   ├── e2e/                     # Testes End-to-End reais (HTTP NestJS + PostgreSQL + AWS SQS SDK)
-│   ├── helpers/                 # Provisionamento automático de PostgreSQL e servidor HTTP SQS para testes
+│   ├── helpers/                 # Conexão automática ao PostgreSQL/LocalStack reais e fallback HTTP SQS
 │   └── load/                    # Benchmark real HTTP + PostgreSQL + autocannon (bun run test:load)
 ├── scripts/
-│   ├── localstack-init.sh       # Criação automática das filas SQS FIFO e DLQ no LocalStack
+│   ├── localstack-init.sh       # Criação automática das 3 filas SQS FIFO no LocalStack
 │   └── migrate.ts               # Executor programático de migrations (up, down, fresh)
 ├── Dockerfile                   # Imagem de produção Bun Alpine com healthcheck e SIGTERM
 ├── docker-compose.yml           # Orquestração completa: postgres + localstack + app

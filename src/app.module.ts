@@ -1,4 +1,5 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
 import { CreateWalletUseCase } from './application/use-cases/create-wallet.use-case';
 import { GetWalletLedgerUseCase } from './application/use-cases/get-wallet-ledger.use-case';
 import { ProcessWagerTransactionUseCase } from './application/use-cases/process-wager-transaction.use-case';
@@ -36,6 +37,10 @@ import { MetricsService } from './infrastructure/metrics/metrics.service';
     AuthGuard,
     NoopProviderIdentityPort,
     {
+      provide: APP_GUARD,
+      useExisting: AuthGuard,
+    },
+    {
       provide: 'ProviderIdentityPort',
       useExisting: NoopProviderIdentityPort,
     },
@@ -72,9 +77,23 @@ import { MetricsService } from './infrastructure/metrics/metrics.service';
     },
     {
       provide: ReconcileWalletUseCase,
-      useFactory: (wRepo: WalletRepository, lRepo: WalletLedgerRepository) =>
-        new ReconcileWalletUseCase(wRepo, lRepo),
-      inject: ['WalletRepository', 'WalletLedgerRepository'],
+      useFactory: (
+        wRepo: WalletRepository,
+        lRepo: WalletLedgerRepository,
+        logger: AppLoggerService,
+        metrics: MetricsService,
+      ) =>
+        new ReconcileWalletUseCase(wRepo, lRepo, {
+          onDivergence: (details) => {
+            metrics.incrementReconciliationDivergence();
+            logger.error(
+              `Accounting reconciliation divergence detected for wallet ${details.walletId}`,
+              undefined,
+              details,
+            );
+          },
+        }),
+      inject: ['WalletRepository', 'WalletLedgerRepository', AppLoggerService, MetricsService],
     },
     {
       provide: ProcessWagerTransactionUseCase,
@@ -85,7 +104,13 @@ import { MetricsService } from './infrastructure/metrics/metrics.service';
         oRepo: OutboxRepository,
         iRepo: InboxRepository,
         uow: UnitOfWork,
-      ) => new ProcessWagerTransactionUseCase(wRepo, txRepo, lRepo, oRepo, iRepo, uow),
+        metrics: MetricsService,
+      ) =>
+        new ProcessWagerTransactionUseCase(wRepo, txRepo, lRepo, oRepo, iRepo, uow, {
+          onLockConflict: () => {
+            metrics.incrementLockConflict();
+          },
+        }),
       inject: [
         'WalletRepository',
         'WagerTransactionRepository',
@@ -93,6 +118,7 @@ import { MetricsService } from './infrastructure/metrics/metrics.service';
         'OutboxRepository',
         'InboxRepository',
         'UnitOfWork',
+        MetricsService,
       ],
     },
     OutboxDispatcherWorker,

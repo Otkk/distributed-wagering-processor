@@ -38,7 +38,8 @@ flowchart TB
 
     subgraph Infra["Infraestrutura Persistente"]
         PG[("PostgreSQL 16\nConstraints + Triggers Append-Only")]
-        SQS[["AWS SQS FIFO (LocalStack)\nwager-transactions.fifo & DLQ"]]
+        SQSIn[["AWS SQS FIFO (LocalStack)\nwager-transactions.fifo & DLQ"]]
+        SQSOut[["AWS SQS FIFO (LocalStack)\nwagering-events.fifo (Outbox)"]]
     end
 
     HTTP --> CW & PW & RW & GL
@@ -47,8 +48,8 @@ flowchart TB
     CW & PW & RW & GL --> Wallet & Tx & Ledger & Money & Events
     CW & PW & RW & GL --> MikroORM
     MikroORM --> PG
-    SQSPub --> SQS
-    SQSConsumer <--> SQS
+    SQSPub --> SQSOut
+    SQSConsumer <--> SQSIn
 ```
 
 ---
@@ -156,14 +157,14 @@ Para que o provedor de jogos saiba exatamente quando deve **parar** (erro defini
      WHERE published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
      ORDER BY occurred_at ASC
      LIMIT 50
-     FOR UPDATE SKIP LOCKED;
-     ```
-     e aplica imediatamente um *short lease* (`claimLease`: `next_attempt_at = NOW() + 30s`, sem incrementar `attempts`), comitando a transação SQL antes de iniciar qualquer I/O de rede.
-  2. **Fase 2 — Publish (Fora da transação SQL)**: publica cada mensagem no AWS SQS FIFO via `@aws-sdk/client-sqs` (`MessageGroupId = aggregateId`, `MessageDeduplicationId = outbox.id`) sem manter nenhuma transação aberta no PostgreSQL.
-  3. **Fase 3 — Confirm (Transação SQL curta)**: grava `published_at = NOW()` em caso de sucesso ou chama `scheduleRetry(now)` (incrementando `attempts` e agendando *exponential backoff* $\min(2^{\text{attempts}} \times 500\text{ms}, 60\text{s})$) em caso de falha. Se o processo sofrer `SIGKILL` durante a Fase 2, o lease de 30s expira automaticamente e outra instância assume o envio.
+      FOR UPDATE SKIP LOCKED;
+      ```
+      e aplica imediatamente um *short lease* (`claimLease`: `next_attempt_at = NOW() + 30s`, sem incrementar `attempts`), comitando a transação SQL antes de iniciar qualquer I/O de rede.
+   2. **Fase 2 — Publish (Fora da transação SQL)**: publica cada evento de integração na fila dedicada **`wagering-events.fifo`** no AWS SQS FIFO via `@aws-sdk/client-sqs` (`MessageGroupId = aggregateId`, `MessageDeduplicationId = outbox.id`) sem manter nenhuma transação aberta no PostgreSQL e sem colidir com a fila de entrada de comandos (`wager-transactions.fifo`).
+   3. **Fase 3 — Confirm (Transação SQL curta)**: grava `published_at = NOW()` em caso de sucesso ou chama `scheduleRetry(now)` (incrementando `attempts` e agendando *exponential backoff* $\min(2^{\text{attempts}} \times 500\text{ms}, 60\text{s})$) em caso de falha. Se o processo sofrer `SIGKILL` durante a Fase 2, o lease de 30s expira automaticamente e outra instância assume o envio.
 
 ### 7.2 Consumer SQS, Persistent Inbox, DLQ e Graceful Shutdown (`SIGTERM`)
-- O [`WagerTransactionConsumer`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/messaging/sqs/wager-transaction.consumer.ts) consome a fila FIFO `wager-transactions.fifo` reutilizando exatamente o mesmo `ProcessWagerTransactionUseCase`.
+- O [`WagerTransactionConsumer`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/messaging/sqs/wager-transaction.consumer.ts) consome a fila FIFO de comandos `wager-transactions.fifo` reutilizando exatamente o mesmo `ProcessWagerTransactionUseCase`.
 - **Deduplicação via Inbox**: cada mensagem recebida é registrada na tabela `inbox_messages` (`PRIMARY KEY (consumer_name, message_id)`) dentro da mesma transação SQL da aposta, sob o lock pessimista da carteira.
 - **ACK Estritamente Pós-Commit**: o comando `DeleteMessage` no SQS só é invocado **após** o commit da transação no PostgreSQL. Se o worker morrer entre o commit e o ACK, o SQS reentregará a mensagem após o *Visibility Timeout*; a segunda instância detectará o registro já processado em `inbox_messages` (e a `idempotency_key` em `wager_transactions`) e confirmará o ACK sem duplicar o débito/crédito.
 - **Classificação de Falhas e DLQ**:
@@ -178,11 +179,15 @@ Para que o provedor de jogos saiba exatamente quando deve **parar** (erro defini
   2. O [`PendingReferenceWorker`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/messaging/outbox/pending-reference.worker.ts) varre periodicamente as transações em `PENDING_REFERENCE`. Assim que a transação referenciada chega e atinge estado `PROCESSED`, o worker reexecuta o caso de uso aplicando a reversão no saldo e no ledger.
   3. Se a referência nunca chegar após `maxAttempts` (default: 5) ou `ttlMs` (default: 60s), o worker transiciona a transação para `REJECTED` com `failureCode = REFERENCE_TIMEOUT` e emite `WagerTransactionRejected`, evitando que transações órfãs fiquem pendentes indefinidamente.
 
+### 7.4 Observabilidade de Conflitos de Lock e Divergências Contábeis (Seções 9 e 12)
+- **Conflitos de Lock por Carteira (`lockConflictsCount`)**: sempre que duas ou mais transações concorrentes disputam simultaneamente o lock pessimista (`SELECT ... FOR UPDATE`) sobre o mesmo `walletId`, o observador injetado em `ProcessWagerTransactionUseCase` incrementa `lockConflictsCount` no [`MetricsService`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/metrics/metrics.service.ts). Operações paralelas em carteiras distintas não geram conflito.
+- **Divergência na Reconciliação (`reconciliationDivergencesCount`)**: conforme exigido na Seção 9, o [`ReconcileWalletUseCase`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/application/use-cases/reconcile-wallet.use-case.ts) **jamais** sobrescreve silenciosamente o saldo caso detecte `storedBalance !== calculatedBalance`. Ele sinaliza `consistent: false` e `difference` na resposta HTTP, registra um erro estruturado (`logger.error`) com os saldos divergentes e incrementa `reconciliationDivergencesCount` em `/health/metrics`.
+
 ---
 
 ## 8. Autenticação e Identidade de Provedores (Seção 2)
 
-Em conformidade com a Seção 2 do desafio (que define autenticação como opcional e fora do foco central de consistência/concorrência), não implementamos cadastro de usuários ou emissão artesanal de credenciais. Definimos a porta de extensão [`ProviderIdentityPort`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts) consumida pelo [`AuthGuard`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts):
+Em conformidade com a Seção 2 do desafio (que define autenticação como opcional e fora do foco central de consistência/concorrência), não implementamos cadastro de usuários ou emissão artesanal de credenciais. Definimos a porta de extensão [`ProviderIdentityPort`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts) consumida pelo [`AuthGuard`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts), registrado globalmente via `APP_GUARD` no [`AppModule`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/app.module.ts):
 - Os endpoints `/health/live`, `/health/ready` e `/health/metrics` são explicitamente abertos (`path.startsWith('/health')`).
 - No MVP, o adaptador `NoopProviderIdentityPort` está registrado por padrão para facilitar os testes funcionais e de carga. Em produção, basta substituir o provider `ProviderIdentityPort` por um adaptador OIDC/JWKS (**Keycloak**, **Zitadel**, **AWS Cognito**) ou validação HMAC-SHA256 (`X-Provider-Signature`).
 
@@ -190,7 +195,7 @@ Em conformidade com a Seção 2 do desafio (que define autenticação como opcio
 
 ## 9. Experimento de Carga Real (`bun run test:load` — HTTP + PostgreSQL + SQS + `autocannon`)
 
-Implementamos o benchmark automatizado em [`tests/load/load-test.ts`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/tests/load/load-test.ts) (executável via `bun run test:load`), que sobe a **aplicação NestJS real escutando via HTTP**, conectada a uma instância **real do PostgreSQL** (executando `SELECT ... FOR UPDATE`, `INSERT`, `UPDATE`, `COMMIT` com escrita em disco) e publica os eventos da Outbox via HTTP usando `@aws-sdk/client-sqs`.
+Implementamos o benchmark automatizado em [`tests/load/load-test.ts`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/tests/load/load-test.ts) (executável via `bun run test:load`), que sobe a **aplicação NestJS real escutando via HTTP**, conectada a uma instância **real do PostgreSQL** (executando `SELECT ... FOR UPDATE`, `INSERT`, `UPDATE`, `COMMIT` com escrita em disco) e publica os eventos da Outbox via HTTP usando `@aws-sdk/client-sqs` (conectando automaticamente ao container LocalStack na porta `4566` quando ativo, ou ao servidor HTTP SQS local `LocalSqsHttpServer` caso o container não esteja rodando).
 
 ### 9.1 Ambiente do Experimento
 - **SO / Arquitetura**: Windows 11 (`win32 10.0.26200 x64`)

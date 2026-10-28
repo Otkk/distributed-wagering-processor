@@ -13,6 +13,7 @@ export class MetricsService {
   private retriesCount: number = 0;
   private dlqMessagesCount: number = 0;
   private lockConflictsCount: number = 0;
+  private reconciliationDivergencesCount: number = 0;
   private outboxLagMs: number = 0;
   private latencies: number[] = [];
 
@@ -34,6 +35,10 @@ export class MetricsService {
 
   public incrementLockConflict(): void {
     this.lockConflictsCount += 1;
+  }
+
+  public incrementReconciliationDivergence(): void {
+    this.reconciliationDivergencesCount += 1;
   }
 
   public setOutboxLag(lagMs: number): void {
@@ -59,6 +64,7 @@ export class MetricsService {
       retriesCount: this.retriesCount,
       dlqMessagesCount: this.dlqMessagesCount,
       lockConflictsCount: this.lockConflictsCount,
+      reconciliationDivergencesCount: this.reconciliationDivergencesCount,
       outboxLagMs: this.outboxLagMs,
       latency: {
         p50,

@@ -2,7 +2,12 @@ import 'reflect-metadata';
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import {
+  ReceiveMessageCommand,
+  SendMessageCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
+import { EntityManager } from '@mikro-orm/postgresql';
 import { AppModule } from '../../src/app.module';
 import { WagerTransactionKind } from '../../src/domain/models/wager-transaction';
 import { GlobalHttpExceptionFilter } from '../../src/infrastructure/http/filters/http-exception.filter';
@@ -10,12 +15,16 @@ import { AppLoggerService } from '../../src/infrastructure/logger/app-logger.ser
 import { OutboxDispatcherWorker } from '../../src/infrastructure/messaging/outbox/outbox-dispatcher.worker';
 import { PendingReferenceWorker } from '../../src/infrastructure/messaging/outbox/pending-reference.worker';
 import { WagerTransactionConsumer } from '../../src/infrastructure/messaging/sqs/wager-transaction.consumer';
-import { ensureRealPostgres, LocalSqsHttpServer } from '../helpers/real-infra.helper';
+import {
+  ensureRealPostgres,
+  ensureSqsEndpoint,
+  SqsEndpointHandle,
+} from '../helpers/real-infra.helper';
 
 describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SDK over HTTP', () => {
   let app: INestApplication;
   let baseUrl: string;
-  let sqsServer: LocalSqsHttpServer;
+  let sqsHandle: SqsEndpointHandle;
   let sqsEndpoint: string;
   let outboxWorker: OutboxDispatcherWorker;
   let pendingRefWorker: PendingReferenceWorker;
@@ -26,9 +35,9 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     const { orm, port: dbPort } = await ensureRealPostgres();
     await orm.close(true);
 
-    // 2. Inicia servidor HTTP SQS real compatível com @aws-sdk/client-sqs
-    sqsServer = new LocalSqsHttpServer(5);
-    sqsEndpoint = await sqsServer.start(0);
+    // 2. Conecta ao LocalStack real (se ativo na 4566) ou inicia servidor HTTP SQS real
+    sqsHandle = await ensureSqsEndpoint();
+    sqsEndpoint = sqsHandle.endpoint;
 
     process.env.DB_PORT = String(dbPort);
     process.env.DISABLE_WORKERS = 'true';
@@ -38,7 +47,8 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     process.env.AWS_SECRET_ACCESS_KEY = 'test';
     process.env.SQS_WAGER_QUEUE_URL = `${sqsEndpoint}/000000000000/wager-transactions.fifo`;
     process.env.SQS_WAGER_DLQ_URL = `${sqsEndpoint}/000000000000/wager-transactions-dlq.fifo`;
-    process.env.SQS_OUTBOX_QUEUE_URL = `${sqsEndpoint}/000000000000/wager-transactions.fifo`;
+    process.env.SQS_OUTBOX_QUEUE_URL = `${sqsEndpoint}/000000000000/wagering-events.fifo`;
+    process.env.SQS_EVENTS_QUEUE_URL = `${sqsEndpoint}/000000000000/wagering-events.fifo`;
 
     // 3. Sobe a aplicação NestJS real escutando em porta TCP real
     app = await NestFactory.create(AppModule, { logger: false });
@@ -67,8 +77,8 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     if (app) {
       await app.close();
     }
-    if (sqsServer) {
-      await sqsServer.stop();
+    if (sqsHandle) {
+      await sqsHandle.stop();
     }
   });
 
@@ -449,9 +459,14 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     expect(recBody.calculatedBalance.amount).toBe('0.00');
     expect(recBody.difference.amount).toBe('0.00');
     expect(recBody.checkedEntries).toBe(11);
+
+    // Verifica que a contenção de lock por carteira foi contabilizada nas métricas (§12)
+    const metricsRes = await fetch(`${baseUrl}/health/metrics`);
+    const metricsBody = (await metricsRes.json()) as { lockConflictsCount: number };
+    expect(metricsBody.lockConflictsCount).toBeGreaterThan(0);
   });
 
-  it('5. Outbox Dispatcher + SQS FIFO Consumer + Persistent Inbox via @aws-sdk/client-sqs e PostgreSQL reais', async () => {
+  it('5. Outbox Dispatcher (wagering-events.fifo) + SQS FIFO Consumer (wager-transactions.fifo) + Persistent Inbox sem colisão de filas', async () => {
     const runId = `sqs-${Date.now()}`;
     const playerId = `player-${runId}`;
 
@@ -465,21 +480,28 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     });
     const wallet = (await createRes.json()) as { id: string };
 
-    // 5.1 Despacha eventos pendentes da tabela outbox_messages para o servidor SQS real
+    // 5.1 Despacha eventos pendentes da tabela outbox_messages para a fila de eventos wagering-events.fifo
     const dispatchRes = await outboxWorker.dispatchBatch(100);
     expect(dispatchRes.published).toBeGreaterThanOrEqual(1);
     expect(dispatchRes.failed).toBe(0);
 
-    // Limpa fila para testar consumo isolado de comando de aposta via SQS
-    sqsServer.reset();
-
-    // 5.2 Publica mensagem FIFO de aposta usando o cliente oficial @aws-sdk/client-sqs
     const sqsClient = new SQSClient({
       region: 'us-east-1',
       endpoint: sqsEndpoint,
       credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
     });
 
+    // Verifica que os eventos de integração foram publicados em wagering-events.fifo (e NÃO em wager-transactions.fifo!)
+    const eventsCheck = await sqsClient.send(
+      new ReceiveMessageCommand({
+        QueueUrl: `${sqsEndpoint}/000000000000/wagering-events.fifo`,
+        MaxNumberOfMessages: 10,
+        WaitTimeSeconds: 0,
+      }),
+    );
+    expect((eventsCheck.Messages || []).length).toBeGreaterThanOrEqual(1);
+
+    // 5.2 Publica mensagem FIFO de comando de aposta em wager-transactions.fifo (sem precisar limpar fila!)
     const wagerEnvelope = {
       messageId: `msg-${runId}`,
       type: 'WagerTransactionRequested',
@@ -509,7 +531,6 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     // 5.3 WagerTransactionConsumer consome via HTTP SQS, persiste no PostgreSQL e remove da fila
     const pollRes = await sqsConsumer.pollOnce();
     expect(pollRes).toEqual(['ACK']);
-    expect(sqsServer.getQueueMessages('wager-transactions.fifo').length).toBe(0);
 
     // 5.4 Verifica saldo atualizado (80.00 - 25.00 = 55.00 BRL) e reconciliação no PostgreSQL
     const recRes = await fetch(`${baseUrl}/wallets/${wallet.id}/reconcile`);
@@ -521,5 +542,52 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     expect(recBody.consistent).toBe(true);
     expect(recBody.storedBalance.amount).toBe('55.00');
     expect(recBody.calculatedBalance.amount).toBe('55.00');
+  });
+
+  it('6. Detecção de Divergência Contábil (§9): sinaliza na resposta, loga erro estruturado, incrementa métrica e não corrige silenciosamente', async () => {
+    const runId = `div-${Date.now()}`;
+    const playerId = `player-${runId}`;
+
+    const createRes = await fetch(`${baseUrl}/wallets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      }),
+    });
+    const wallet = (await createRes.json()) as { id: string };
+
+    // Adultera diretamente o saldo armazenado no PostgreSQL para simular corrupção externa
+    const em = app.get(EntityManager);
+    await em
+      .getConnection()
+      .execute(`UPDATE wallets SET balance_amount = 145.00 WHERE id = ?`, [wallet.id]);
+
+    const recRes = await fetch(`${baseUrl}/wallets/${wallet.id}/reconciliation`, {
+      method: 'POST',
+    });
+    expect(recRes.status).toBe(200);
+    const recBody = (await recRes.json()) as {
+      consistent: boolean;
+      storedBalance: { amount: string };
+      calculatedBalance: { amount: string };
+      difference: { amount: string };
+    };
+    expect(recBody.consistent).toBe(false);
+    expect(recBody.storedBalance.amount).toBe('145.00');
+    expect(recBody.calculatedBalance.amount).toBe('100.00');
+    expect(recBody.difference.amount).toBe('45.00');
+
+    // Confirma que a divergência NÃO foi sobrescrita silenciosamente e que a métrica foi incrementada
+    const getWalletRes = await fetch(`${baseUrl}/wallets/${wallet.id}`);
+    const getWalletBody = (await getWalletRes.json()) as { balance: { amount: string } };
+    expect(getWalletBody.balance.amount).toBe('145.00');
+
+    const metricsRes = await fetch(`${baseUrl}/health/metrics`);
+    const metricsBody = (await metricsRes.json()) as {
+      reconciliationDivergencesCount: number;
+    };
+    expect(metricsBody.reconciliationDivergencesCount).toBeGreaterThanOrEqual(1);
   });
 });
