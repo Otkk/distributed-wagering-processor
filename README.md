@@ -1,5 +1,9 @@
 # Technical Challenge — Distributed Wagering Processor
 
+> 📌 **Documentação da Implementação**:
+> - **Decisões Arquiteturais, Concorrência, Trade-offs e Relatório de Carga**: consulte [`ARCHITECTURE.md`](./ARCHITECTURE.md)
+> - **Guia Rápido de Setup, Migrations, Endpoints e Comandos de Teste**: consulte a [Seção 15 — Guia de Execução e Testes](#15-guia-de-execução-setup-e-testes) ao final deste arquivo.
+
 ## Bem-vindo à Jungle Gaming 🦧
 
 A **Jungle Gaming** é uma software house especializada em iGaming — desenvolvemos plataformas de cassino online com tecnologia de ponta: NestJS, Bun, TanStack, DDD e arquitetura orientada a eventos. Somos apaixonados por engenharia de software e acreditamos que grandes produtos nascem de grandes times.
@@ -744,3 +748,92 @@ wallet.balance == saldo reconstruído pelo ledger
 ### Diferenciais opcionais
 
 Teste de carga também conta como diferencial. Se fizer, exponha como `bun run test:load` e registre ambiente, metodologia, throughput, p50/p95/p99, taxa de erro, conflitos de concorrência e outbox lag. Não há meta de RPS — a qualidade do experimento e a honestidade da análise pesam mais que o número bruto.
+
+---
+
+## 15. Guia de Execução, Setup e Testes
+
+### 15.1 Pré-requisitos
+
+- **Bun** `>= 1.1` (testado com `Bun 1.4.4`)
+- **Docker & Docker Compose** (para subir `PostgreSQL 16` e `LocalStack SQS`)
+
+### 15.2 Setup Inicial
+
+1. Instale as dependências:
+   ```bash
+   bun install
+   ```
+
+2. Configure as variáveis de ambiente (o arquivo `.env` já acompanha valores padrão prontos para o Docker Compose local):
+   ```bash
+   cp .env.example .env
+   ```
+
+3. Suba a infraestrutura local (`PostgreSQL 16` na porta `5432` e `LocalStack SQS` na porta `4566` com provisionamento automático das filas FIFO `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `wagering-events.fifo` via `scripts/localstack-init.sh`):
+   ```bash
+   docker compose up -d
+   ```
+
+4. Execute as migrations versionadas no PostgreSQL:
+   ```bash
+   bun run migration:up
+   ```
+
+5. Inicie a aplicação:
+   ```bash
+   # Modo desenvolvimento (watch)
+   bun run start:dev
+
+   # Modo produção
+   bun run build
+   bun run start
+   ```
+
+---
+
+### 15.3 Comandos de Testes e Verificação
+
+| Comando | Descrição |
+|---|---|
+| `bun run test` | Executa a suíte de **testes de unidade** (`Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `CanonicalHash`, `UseCases`, `Controllers`, `PrematureFailures`) |
+| `bun run test:integration` | Executa a suíte de **testes de integração** (migrations `up`/`down`, constraints SQL, triggers append-only, repositórios MikroORM, rollback atômico e adaptadores SQS) |
+| `bun run test:concurrency` | Executa a suíte de **testes de concorrência real e resiliência** (50x idempotência em paralelo, disputa de saldo em *hot wallet*, 20 carteiras paralelas, 4 instâncias simultâneas, `SIGTERM` devolvendo visibilidade, worker crash pós-commit e resolução de `PENDING_REFERENCE`) |
+| `bun run test:all` | Executa **todas as 91 especificações de teste** (`unit` + `integration` + `concurrency`) |
+| `bun run test:load` | Executa o **experimento automatizado de carga e estresse** (Perfil A Multi-Wallet vs Perfil B Hot Wallet 50x) com auditoria contábil final (`wallet.balance == sum(ledger)`) |
+| `bun x tsc --noEmit` | Validação estrita de tipos do TypeScript (`strict: true`) |
+
+---
+
+### 15.4 Estrutura do Projeto
+
+```text
+├── src/
+│   ├── domain/                  # Núcleo de domínio puro (zero dependências externas de infra)
+│   │   ├── errors/              # Hierarquia DomainError e códigos semânticos FailureCode
+│   │   ├── events/              # IntegrationEvent<T> e eventos de domínio/integração
+│   │   ├── models/              # Money (decimal.js), Wallet, WagerTransaction, WalletLedgerEntry, Inbox, Outbox
+│   │   └── ports/               # Interfaces de repositórios e UnitOfWork
+│   ├── application/             # Casos de uso transacionais ACID
+│   │   ├── dto/                 # Contratos de entrada/saída da camada de aplicação
+│   │   └── use-cases/           # CreateWallet, ProcessWagerTransaction, ReconcileWallet, GetWalletLedger
+│   ├── infrastructure/          # Adaptadores HTTP, Persistência PostgreSQL/MikroORM, SQS e Telemetria
+│   │   ├── database/            # Entities MikroORM, Migrations reversíveis, Repositórios e UnitOfWork
+│   │   ├── http/                # Controllers REST, DTOs validados, ExceptionFilter, AuthGuard, CorrelationId
+│   │   ├── logger/              # Logger estruturado JSON (Pino) sem vazamento de dados sensíveis
+│   │   ├── messaging/           # WagerTransactionConsumer (SQS), OutboxDispatcherWorker, PendingReferenceWorker
+│   │   └── metrics/             # Coleta de métricas operacionais, latência (p50/p95/p99) e outbox lag
+│   ├── app.module.ts
+│   └── main.ts
+├── tests/
+│   ├── unit/                    # Testes unitários de domínio, casos de uso, controllers e armadilhas eliminatórias
+│   ├── integration/             # Testes de integração de migrations, repositórios, atomicidade e containers
+│   ├── concurrency/             # Cenários obrigatórios das Seções 8 e 13 (paralelismo real e multi-instância)
+│   └── load/                    # Script de benchmark e teste de carga (bun run test:load)
+├── scripts/
+│   └── localstack-init.sh       # Criação automática das filas SQS FIFO e DLQ no LocalStack
+├── docker-compose.yml
+├── ARCHITECTURE.md              # Decisões arquiteturais, justificativa do ORM, trade-offs e relatório de carga
+└── README.md
+```
+
