@@ -1,8 +1,18 @@
+import { v4 as uuidv4 } from 'uuid';
 import { FailureCode } from '../errors/domain.error';
 import { LedgerDirection } from '../models/ledger-direction';
-import { MoneyProps } from '../models/money';
-import { WagerTransactionKind } from '../models/wager-transaction';
+import { Money, MoneyProps } from '../models/money';
+import { WagerTransaction, WagerTransactionKind } from '../models/wager-transaction';
+import { Wallet } from '../models/wallet';
+import { WalletLedgerEntry } from '../models/wallet-ledger-entry';
 import { IntegrationEvent, IntegrationEventProps } from './integration-event';
+
+export interface EventContext {
+  eventId?: string;
+  correlationId: string;
+  causationId?: string;
+  occurredAt?: Date;
+}
 
 export interface WalletBalanceChangedData {
   walletId: string;
@@ -20,6 +30,29 @@ export class WalletBalanceChanged extends IntegrationEvent<WalletBalanceChangedD
 
   constructor(props: IntegrationEventProps<WalletBalanceChangedData>) {
     super(props);
+  }
+
+  public static from(
+    wallet: Wallet,
+    entry: WalletLedgerEntry,
+    ctx: EventContext,
+  ): WalletBalanceChanged {
+    return new WalletBalanceChanged({
+      eventId: ctx.eventId || uuidv4(),
+      aggregateId: wallet.id,
+      correlationId: ctx.correlationId,
+      causationId: ctx.causationId,
+      occurredAt: ctx.occurredAt || new Date(),
+      data: {
+        walletId: wallet.id,
+        transactionId: entry.transactionId,
+        direction: entry.direction,
+        money: entry.money.toJSON(),
+        balanceBefore: entry.balanceBefore.toJSON(),
+        balanceAfter: entry.balanceAfter.toJSON(),
+        walletVersion: wallet.version,
+      },
+    });
   }
 }
 
@@ -43,6 +76,33 @@ export class WagerTransactionProcessed extends IntegrationEvent<WagerTransaction
 
   constructor(props: IntegrationEventProps<WagerTransactionProcessedData>) {
     super(props);
+  }
+
+  public static from(
+    tx: WagerTransaction,
+    _walletBalance: Money,
+    ctx: EventContext,
+  ): WagerTransactionProcessed {
+    return new WagerTransactionProcessed({
+      eventId: ctx.eventId || uuidv4(),
+      aggregateId: tx.walletId,
+      correlationId: ctx.correlationId,
+      causationId: ctx.causationId,
+      occurredAt: ctx.occurredAt || new Date(),
+      data: {
+        transactionId: tx.id,
+        providerId: tx.providerId,
+        externalTransactionId: tx.externalTransactionId,
+        walletId: tx.walletId,
+        playerId: tx.playerId,
+        roundId: tx.roundId,
+        gameId: tx.gameId,
+        kind: tx.kind,
+        money: tx.money.toJSON(),
+        referenceTransactionId: tx.referenceTransactionId,
+        processedAt: (tx.processedAt || new Date()).toISOString(),
+      },
+    });
   }
 }
 

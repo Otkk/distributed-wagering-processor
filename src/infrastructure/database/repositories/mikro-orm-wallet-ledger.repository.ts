@@ -1,3 +1,4 @@
+import Decimal from 'decimal.js';
 import { EntityManager } from '@mikro-orm/postgresql';
 import {
   LedgerPaginationResult,
@@ -70,16 +71,17 @@ export class MikroOrmWalletLedgerRepository implements WalletLedgerRepository {
       .where('wallet_id', walletId)
       .select(
         knex.raw(
-          "COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amount ELSE -amount END), 0) as calculated_amount",
+          "COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amount ELSE -amount END), 0.00) as calculated_amount",
         ),
         knex.raw('COUNT(*) as count'),
       )
       .first();
 
-    const amountNum = Number(result?.calculated_amount || 0);
+    const rawAmount = String(result?.calculated_amount ?? '0.00');
+    const decimalAmount = new Decimal(rawAmount).toDecimalPlaces(2, Decimal.ROUND_HALF_EVEN);
     return {
-      calculatedAmount: amountNum.toFixed(2),
-      count: Number(result?.count || 0),
+      calculatedAmount: decimalAmount.toFixed(2),
+      count: parseInt(String(result?.count ?? '0'), 10),
     };
   }
 }
