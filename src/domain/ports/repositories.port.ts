@@ -15,6 +15,7 @@ export interface WagerTransactionRepository {
   findByIdempotencyKey(key: string): Promise<WagerTransaction | null>;
   findByProviderAndExternalId(providerId: string, externalId: string): Promise<WagerTransaction | null>;
   findPendingReferences(limit: number): Promise<WagerTransaction[]>;
+  findProcessedReversal?(referenceTransactionId: string, kind: string): Promise<WagerTransaction | null>;
   save(transaction: WagerTransaction): Promise<void>;
 }
 

@@ -102,8 +102,13 @@ export class ProcessWagerTransactionUseCase {
       // 4. Verificação de Idempotência sob o Lock da Carteira
       const existingTx = await this.txRepo.findByIdempotencyKey(input.idempotencyKey);
       if (existingTx) {
-        if (existingTx.matchesPayload(payloadHash)) {
-          // Replay idêntico
+        if (!existingTx.matchesPayload(payloadHash)) {
+          // Mesma chave com payload divergente = Conflito
+          throw new IdempotencyConflictError(input.idempotencyKey);
+        }
+        if (existingTx.isTerminal()) {
+          // Replay idêntico de transação terminal
+          await this.recordInboxIfPresent(input, payloadHash, new Date());
           return {
             transactionId: existingTx.id,
             status: existingTx.status,
@@ -111,32 +116,32 @@ export class ProcessWagerTransactionUseCase {
             idempotentReplay: true,
             failureCode: existingTx.failureCode,
           };
-        } else {
-          // Mesma chave com payload divergente = Conflito
-          throw new IdempotencyConflictError(input.idempotencyKey);
         }
       }
 
       const now = new Date();
-      const txId = uuidv4();
       const correlationId = input.idempotencyKey;
+      const isResumingPending =
+        existingTx !== null && existingTx.status === WagerTransactionStatus.PendingReference;
 
-      // Cria a entidade da transação em estado PENDING
-      const tx = WagerTransaction.create({
-        id: txId,
-        providerId: input.providerId,
-        externalTransactionId: input.externalTransactionId,
-        idempotencyKey: input.idempotencyKey,
-        payloadHash,
-        walletId: input.walletId,
-        playerId: input.playerId,
-        roundId: input.roundId,
-        gameId: input.gameId,
-        kind: input.kind,
-        money,
-        referenceExternalTransactionId: input.referenceExternalTransactionId,
-        createdAt: now,
-      });
+      // Cria a entidade da transação em estado PENDING (ou reutiliza a existente em PENDING_REFERENCE)
+      const tx =
+        existingTx ??
+        WagerTransaction.create({
+          id: uuidv4(),
+          providerId: input.providerId,
+          externalTransactionId: input.externalTransactionId,
+          idempotencyKey: input.idempotencyKey,
+          payloadHash,
+          walletId: input.walletId,
+          playerId: input.playerId,
+          roundId: input.roundId,
+          gameId: input.gameId,
+          kind: input.kind,
+          money,
+          referenceExternalTransactionId: input.referenceExternalTransactionId,
+          createdAt: now,
+        });
 
       // 5. Resolução de Referências (REFUND e ROLLBACK)
       let referenceTx: WagerTransaction | null = null;
@@ -146,8 +151,22 @@ export class ProcessWagerTransactionUseCase {
           input.referenceExternalTransactionId!,
         );
 
-        // 5.1 Se a referência não foi encontrada: armazena como PENDING_REFERENCE
-        if (!referenceTx) {
+        // 5.1 Se a referência não foi encontrada (ou ainda não está finalizada): armazena como PENDING_REFERENCE
+        if (
+          !referenceTx ||
+          referenceTx.status === WagerTransactionStatus.Pending ||
+          referenceTx.status === WagerTransactionStatus.PendingReference
+        ) {
+          if (isResumingPending) {
+            await this.recordInboxIfPresent(input, payloadHash, now);
+            return {
+              transactionId: tx.id,
+              status: WagerTransactionStatus.PendingReference,
+              balance: wallet.balance.toJSON(),
+              idempotentReplay: true,
+            };
+          }
+
           tx.markPendingReference();
           await this.txRepo.save(tx);
 
@@ -170,6 +189,7 @@ export class ProcessWagerTransactionUseCase {
             },
           });
           await this.outboxRepo.save(OutboxMessage.enqueue(pendingEvent));
+          await this.recordInboxIfPresent(input, payloadHash, now);
 
           return {
             transactionId: tx.id,
@@ -179,30 +199,12 @@ export class ProcessWagerTransactionUseCase {
           };
         }
 
-        // 5.2 Validações da referência encontrada
-        if (
-          referenceTx.playerId !== input.playerId ||
-          referenceTx.walletId !== input.walletId ||
-          referenceTx.roundId !== input.roundId ||
-          referenceTx.money.currency !== money.currency
-        ) {
-          tx.reject(FailureCode.REFERENCE_ROUND_MISMATCH);
-          await this.txRepo.save(tx);
-          await this.saveRejectionOutbox(tx, correlationId, now);
-          return {
-            transactionId: tx.id,
-            status: WagerTransactionStatus.Rejected,
-            balance: wallet.balance.toJSON(),
-            idempotentReplay: false,
-            failureCode: FailureCode.REFERENCE_ROUND_MISMATCH,
-          };
-        }
-
-        // Validação de tipo: REFUND só referencia BET
-        if (input.kind === WagerTransactionKind.Refund && referenceTx.kind !== WagerTransactionKind.Bet) {
+        // 5.2 A referência precisa estar PROCESSED para ser revertida
+        if (referenceTx.status !== WagerTransactionStatus.Processed) {
           tx.reject(FailureCode.INVALID_REFERENCE_TYPE);
           await this.txRepo.save(tx);
           await this.saveRejectionOutbox(tx, correlationId, now);
+          await this.recordInboxIfPresent(input, payloadHash, now);
           return {
             transactionId: tx.id,
             status: WagerTransactionStatus.Rejected,
@@ -212,11 +214,56 @@ export class ProcessWagerTransactionUseCase {
           };
         }
 
-        // Validação de valor: montante deve ser igual ao da referência
+        // 5.3 Validações de titularidade, carteira, rodada e moeda da referência
+        if (
+          referenceTx.playerId !== input.playerId ||
+          referenceTx.walletId !== input.walletId ||
+          referenceTx.roundId !== input.roundId ||
+          referenceTx.money.currency !== money.currency
+        ) {
+          tx.reject(FailureCode.REFERENCE_ROUND_MISMATCH);
+          await this.txRepo.save(tx);
+          await this.saveRejectionOutbox(tx, correlationId, now);
+          await this.recordInboxIfPresent(input, payloadHash, now);
+          return {
+            transactionId: tx.id,
+            status: WagerTransactionStatus.Rejected,
+            balance: wallet.balance.toJSON(),
+            idempotentReplay: false,
+            failureCode: FailureCode.REFERENCE_ROUND_MISMATCH,
+          };
+        }
+
+        // 5.4 Validação de tipo: REFUND só referencia BET; ROLLBACK referencia BET, WIN ou REFUND
+        const isInvalidRefundRef =
+          input.kind === WagerTransactionKind.Refund &&
+          referenceTx.kind !== WagerTransactionKind.Bet;
+        const isInvalidRollbackRef =
+          input.kind === WagerTransactionKind.Rollback &&
+          referenceTx.kind !== WagerTransactionKind.Bet &&
+          referenceTx.kind !== WagerTransactionKind.Win &&
+          referenceTx.kind !== WagerTransactionKind.Refund;
+
+        if (isInvalidRefundRef || isInvalidRollbackRef) {
+          tx.reject(FailureCode.INVALID_REFERENCE_TYPE);
+          await this.txRepo.save(tx);
+          await this.saveRejectionOutbox(tx, correlationId, now);
+          await this.recordInboxIfPresent(input, payloadHash, now);
+          return {
+            transactionId: tx.id,
+            status: WagerTransactionStatus.Rejected,
+            balance: wallet.balance.toJSON(),
+            idempotentReplay: false,
+            failureCode: FailureCode.INVALID_REFERENCE_TYPE,
+          };
+        }
+
+        // 5.5 Validação de valor: montante deve ser igual ao da referência
         if (!referenceTx.money.equals(money)) {
           tx.reject(FailureCode.REFERENCE_AMOUNT_MISMATCH);
           await this.txRepo.save(tx);
           await this.saveRejectionOutbox(tx, correlationId, now);
+          await this.recordInboxIfPresent(input, payloadHash, now);
           return {
             transactionId: tx.id,
             status: WagerTransactionStatus.Rejected,
@@ -226,8 +273,26 @@ export class ProcessWagerTransactionUseCase {
           };
         }
 
-        // Validação de duplicidade de reversão: já foi revertida?
-        // (Será verificada por busca de transações existentes com referenceTransactionId igual)
+        // 5.6 Validação de duplicidade de reversão: referência não pode ser revertida duas vezes pelo mesmo tipo
+        if (this.txRepo.findProcessedReversal) {
+          const existingReversal = await this.txRepo.findProcessedReversal(
+            referenceTx.id,
+            input.kind,
+          );
+          if (existingReversal && existingReversal.id !== tx.id) {
+            tx.reject(FailureCode.REFERENCE_ALREADY_REVERSED);
+            await this.txRepo.save(tx);
+            await this.saveRejectionOutbox(tx, correlationId, now);
+            await this.recordInboxIfPresent(input, payloadHash, now);
+            return {
+              transactionId: tx.id,
+              status: WagerTransactionStatus.Rejected,
+              balance: wallet.balance.toJSON(),
+              idempotentReplay: false,
+              failureCode: FailureCode.REFERENCE_ALREADY_REVERSED,
+            };
+          }
+        }
       }
 
       // 6. Aplicação da Movimentação Financeira
@@ -236,6 +301,7 @@ export class ProcessWagerTransactionUseCase {
           tx.reject(FailureCode.INSUFFICIENT_FUNDS);
           await this.txRepo.save(tx);
           await this.saveRejectionOutbox(tx, correlationId, now);
+          await this.recordInboxIfPresent(input, payloadHash, now);
           return {
             transactionId: tx.id,
             status: WagerTransactionStatus.Rejected,
@@ -293,6 +359,7 @@ export class ProcessWagerTransactionUseCase {
             tx.reject(FailureCode.NEGATIVE_BALANCE_PREVENTED);
             await this.txRepo.save(tx);
             await this.saveRejectionOutbox(tx, correlationId, now);
+            await this.recordInboxIfPresent(input, payloadHash, now);
             return {
               transactionId: tx.id,
               status: WagerTransactionStatus.Rejected,
@@ -371,16 +438,7 @@ export class ProcessWagerTransactionUseCase {
       }
 
       // 7. Registra Inbox se a mensagem veio de mensageria
-      if (input.messageId && input.consumerName) {
-        const inbox = InboxMessage.receive({
-          messageId: input.messageId,
-          consumerName: input.consumerName,
-          payloadHash,
-          receivedAt: now,
-        });
-        inbox.markProcessed(now);
-        await this.inboxRepo.save(inbox);
-      }
+      await this.recordInboxIfPresent(input, payloadHash, now);
 
       return {
         transactionId: tx.id,
@@ -389,6 +447,23 @@ export class ProcessWagerTransactionUseCase {
         idempotentReplay: false,
       };
     });
+  }
+
+  private async recordInboxIfPresent(
+    input: ProcessWagerInput,
+    payloadHash: string,
+    now: Date,
+  ): Promise<void> {
+    if (input.messageId && input.consumerName) {
+      const inbox = InboxMessage.receive({
+        messageId: input.messageId,
+        consumerName: input.consumerName,
+        payloadHash,
+        receivedAt: now,
+      });
+      inbox.markProcessed(now);
+      await this.inboxRepo.save(inbox);
+    }
   }
 
   private async saveSuccessOutbox(

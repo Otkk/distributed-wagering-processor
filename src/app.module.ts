@@ -18,6 +18,13 @@ import { WalletsController } from './infrastructure/http/controllers/wallets.con
 import { AuthGuard, NoopProviderIdentityPort } from './infrastructure/http/guards/auth.guard';
 import { CorrelationIdMiddleware } from './infrastructure/http/middlewares/correlation-id.middleware';
 import { AppLoggerService } from './infrastructure/logger/app-logger.service';
+import { OutboxDispatcherWorker } from './infrastructure/messaging/outbox/outbox-dispatcher.worker';
+import { PendingReferenceWorker } from './infrastructure/messaging/outbox/pending-reference.worker';
+import { SqsEventPublisher } from './infrastructure/messaging/sqs/sqs-event-publisher';
+import {
+  AwsSqsConsumerClient,
+  WagerTransactionConsumer,
+} from './infrastructure/messaging/sqs/wager-transaction.consumer';
 import { MetricsService } from './infrastructure/metrics/metrics.service';
 
 @Module({
@@ -28,6 +35,14 @@ import { MetricsService } from './infrastructure/metrics/metrics.service';
     MetricsService,
     AuthGuard,
     NoopProviderIdentityPort,
+    {
+      provide: 'EventPublisherPort',
+      useClass: SqsEventPublisher,
+    },
+    {
+      provide: 'SqsConsumerClientPort',
+      useClass: AwsSqsConsumerClient,
+    },
     {
       provide: CreateWalletUseCase,
       useFactory: (
@@ -76,16 +91,9 @@ import { MetricsService } from './infrastructure/metrics/metrics.service';
         'UnitOfWork',
       ],
     },
-    {
-      provide: 'WalletRepository',
-      useFactory: (wRepo: WalletRepository) => wRepo,
-      inject: ['WalletRepository'],
-    },
-    {
-      provide: 'WagerTransactionRepository',
-      useFactory: (txRepo: WagerTransactionRepository) => txRepo,
-      inject: ['WagerTransactionRepository'],
-    },
+    OutboxDispatcherWorker,
+    PendingReferenceWorker,
+    WagerTransactionConsumer,
   ],
 })
 export class AppModule implements NestModule {
