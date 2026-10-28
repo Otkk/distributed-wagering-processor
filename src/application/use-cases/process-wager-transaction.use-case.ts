@@ -73,21 +73,10 @@ export class ProcessWagerTransactionUseCase {
     const payloadHash = computePayloadHash(canonicalPayload);
 
     return this.uow.transactional(async () => {
-      // 2. Deduplicação de fila (Persistent Inbox)
-      if (input.messageId && input.consumerName) {
-        const existingInbox = await this.inboxRepo.find(input.consumerName, input.messageId);
-        if (existingInbox && existingInbox.isProcessed()) {
-          const wallet = await this.walletRepo.findById(input.walletId);
-          return {
-            transactionId: input.externalTransactionId,
-            status: WagerTransactionStatus.Processed,
-            balance: wallet ? wallet.balance.toJSON() : money.toJSON(),
-            idempotentReplay: true,
-          };
-        }
-      }
+      const msgId = input.messageId ?? input.inboxContext?.messageId;
+      const consName = input.consumerName ?? input.inboxContext?.consumerName;
 
-      // 3. Concorrência: Pessimistic Lock na Wallet (Unidade de concorrência é a walletId)
+      // 2. Concorrência: Pessimistic Lock na Wallet (Unidade de concorrência é a walletId)
       const wallet = await this.walletRepo.findById(input.walletId, 'pessimistic_write');
       if (!wallet) {
         throw new WalletNotFoundError(input.walletId);
@@ -97,6 +86,26 @@ export class ProcessWagerTransactionUseCase {
       }
       if (wallet.currency !== money.currency) {
         throw new CurrencyMismatchError(wallet.currency, money.currency);
+      }
+
+      // 3. Deduplicação de fila (Persistent Inbox) sob o lock da carteira
+      if (msgId && consName) {
+        const existingInbox = await this.inboxRepo.find(consName, msgId);
+        if (existingInbox) {
+          if (!existingInbox.matchesPayload(payloadHash)) {
+            throw new IdempotencyConflictError(`${consName}:${msgId}`);
+          }
+          if (existingInbox.isProcessed()) {
+            const txForInbox = await this.txRepo.findByIdempotencyKey(input.idempotencyKey);
+            return {
+              transactionId: txForInbox ? txForInbox.id : input.externalTransactionId,
+              status: txForInbox ? txForInbox.status : WagerTransactionStatus.Processed,
+              balance: wallet.balance.toJSON(),
+              idempotentReplay: true,
+              failureCode: txForInbox?.failureCode,
+            };
+          }
+        }
       }
 
       // 4. Verificação de Idempotência sob o Lock da Carteira
@@ -116,6 +125,17 @@ export class ProcessWagerTransactionUseCase {
             idempotentReplay: true,
             failureCode: existingTx.failureCode,
           };
+        }
+      } else {
+        // Verifica unicidade de (providerId, externalTransactionId) caso enviem outra Idempotency-Key
+        const existingByExternal = await this.txRepo.findByProviderAndExternalId(
+          input.providerId,
+          input.externalTransactionId,
+        );
+        if (existingByExternal) {
+          throw new IdempotencyConflictError(
+            `${input.providerId}:${input.externalTransactionId}`,
+          );
         }
       }
 
@@ -454,10 +474,12 @@ export class ProcessWagerTransactionUseCase {
     payloadHash: string,
     now: Date,
   ): Promise<void> {
-    if (input.messageId && input.consumerName) {
+    const msgId = input.messageId ?? input.inboxContext?.messageId;
+    const consName = input.consumerName ?? input.inboxContext?.consumerName;
+    if (msgId && consName) {
       const inbox = InboxMessage.receive({
-        messageId: input.messageId,
-        consumerName: input.consumerName,
+        messageId: msgId,
+        consumerName: consName,
         payloadHash,
         receivedAt: now,
       });

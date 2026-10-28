@@ -19,6 +19,10 @@ export interface ProcessWagerInput {
   // Metadata para mensageria assíncrona
   messageId?: string;
   consumerName?: string;
+  inboxContext?: {
+    consumerName: string;
+    messageId: string;
+  };
 }
 
 export interface ProcessWagerOutput {

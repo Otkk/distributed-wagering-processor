@@ -52,6 +52,10 @@ export class InboxMessage {
     return this._processedAt !== undefined;
   }
 
+  public matchesPayload(hash: string): boolean {
+    return this.payloadHash === hash;
+  }
+
   public markProcessed(at: Date): void {
     this._processedAt = at;
   }

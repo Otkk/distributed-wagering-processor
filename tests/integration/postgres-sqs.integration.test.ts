@@ -554,8 +554,8 @@ describe('Integration Suite: Migrations, MikroORM Repositories, Atomic Rollback 
     });
   });
 
-  describe('3. Live PostgreSQL 16 Container Verification (Automatic when Docker Compose is up)', () => {
-    it('deve executar migrations e validar triggers/constraints diretamente no PostgreSQL 16 se o container estiver ativo', async () => {
+  describe('3. Live PostgreSQL 16 & LocalStack SQS Container Verification (Automatic when Docker Compose is up)', () => {
+    it('deve executar migrations, constraints (CHECK/UNIQUE), triggers append-only, atomicidade, outbox SKIP LOCKED e concorrência no PostgreSQL 16 real', async () => {
       const dbHost = process.env.DB_HOST || 'localhost';
       const dbPort = Number(process.env.DB_PORT) || 5432;
       const pgAvailable = await isPortOpen(dbHost, dbPort);
@@ -574,7 +574,7 @@ describe('Integration Suite: Migrations, MikroORM Repositories, Atomic Rollback 
         if (process.env.REQUIRE_INFRA === 'true') {
           throw err;
         }
-        // Porta 5432 ocupada por instância local fora do Docker Compose (credenciais diferentes de jungle/wagering_db)
+        // Porta 5432 ocupada por instância local fora do Docker Compose (credenciais diferentes de postgres/wagering_db)
         expect(mikroOrmConfig.dbName).toBeDefined();
         expect(mikroOrmConfig.entities?.length).toBe(5);
         if (orm) await orm.close(true).catch(() => {});
@@ -615,22 +615,58 @@ describe('Integration Suite: Migrations, MikroORM Repositories, Atomic Rollback 
           initialBalance: { amount: '100.00', currency: 'BRL' },
         });
 
-        const bet = await processWager.execute({
-          providerId: 'pg-live-prov',
-          externalTransactionId: `pg-live-bet-${Date.now()}`,
-          idempotencyKey: `pg-live-prov:bet-${Date.now()}`,
-          playerId,
-          walletId: wallet.id,
-          roundId: 'r-live',
-          gameId: 'fortune-tiger',
-          kind: WagerTransactionKind.Bet,
-          money: { amount: '40.00', currency: 'BRL' },
-        });
+        // 1. Constraint CHECK (balance_amount >= 0) no PostgreSQL real
+        await expect(
+          em
+            .getConnection()
+            .execute(`UPDATE wallets SET balance_amount = -0.01 WHERE id = ?`, [wallet.id]),
+        ).rejects.toThrow();
 
-        expect(bet.status).toBe(WagerTransactionStatus.Processed);
-        expect(bet.balance.amount).toBe('60.00');
+        // 2. Disputa concorrente de saldo real sobre PostgreSQL 16 (SELECT ... FOR UPDATE):
+        // Duas apostas simultâneas de 80.00 BRL sobre saldo de 100.00 BRL usando EntityManagers isolados
+        const makeNodeUseCase = () => {
+          const nodeEm = orm!.em.fork();
+          return new ProcessWagerTransactionUseCase(
+            new MikroOrmWalletRepository(nodeEm),
+            new MikroOrmWagerTransactionRepository(nodeEm),
+            new MikroOrmWalletLedgerRepository(nodeEm),
+            new MikroOrmOutboxRepository(nodeEm),
+            new MikroOrmInboxRepository(nodeEm),
+            new MikroOrmUnitOfWork(nodeEm),
+          );
+        };
 
-        // Valida trigger append-only no PostgreSQL real: UPDATE no ledger DEVE falhar!
+        const ts = Date.now();
+        const [bet1, bet2] = await Promise.all([
+          makeNodeUseCase().execute({
+            providerId: 'pg-live-prov',
+            externalTransactionId: `pg-live-bet1-${ts}`,
+            idempotencyKey: `pg-live-prov:bet1-${ts}`,
+            playerId,
+            walletId: wallet.id,
+            roundId: 'r-live',
+            gameId: 'fortune-tiger',
+            kind: WagerTransactionKind.Bet,
+            money: { amount: '80.00', currency: 'BRL' },
+          }),
+          makeNodeUseCase().execute({
+            providerId: 'pg-live-prov',
+            externalTransactionId: `pg-live-bet2-${ts}`,
+            idempotencyKey: `pg-live-prov:bet2-${ts}`,
+            playerId,
+            walletId: wallet.id,
+            roundId: 'r-live',
+            gameId: 'fortune-tiger',
+            kind: WagerTransactionKind.Bet,
+            money: { amount: '80.00', currency: 'BRL' },
+          }),
+        ]);
+
+        const statuses = [bet1.status, bet2.status];
+        expect(statuses).toContain(WagerTransactionStatus.Processed);
+        expect(statuses).toContain(WagerTransactionStatus.Rejected);
+
+        // 3. Valida trigger append-only no PostgreSQL real: UPDATE e DELETE no ledger DEVEM falhar!
         await expect(
           em
             .getConnection()
@@ -638,10 +674,18 @@ describe('Integration Suite: Migrations, MikroORM Repositories, Atomic Rollback 
               wallet.id,
             ]),
         ).rejects.toThrow();
+        await expect(
+          em
+            .getConnection()
+            .execute(`DELETE FROM wallet_ledger_entries WHERE wallet_id = ?`, [wallet.id]),
+        ).rejects.toThrow();
 
+        // 4. Invariante universal contábil no PostgreSQL real
         const rec = await reconcile.execute(wallet.id);
         expect(rec.consistent).toBe(true);
-        expect(rec.storedBalance.amount).toBe('60.00');
+        expect(rec.storedBalance.amount).toBe('20.00');
+        expect(rec.calculatedBalance.amount).toBe('20.00');
+        expect(rec.difference.amount).toBe('0.00');
       } finally {
         await orm.close(true);
       }
