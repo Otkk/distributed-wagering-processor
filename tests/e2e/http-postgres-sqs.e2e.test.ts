@@ -71,7 +71,7 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     outboxWorker = app.get(OutboxDispatcherWorker);
     pendingRefWorker = app.get(PendingReferenceWorker);
     sqsConsumer = app.get(WagerTransactionConsumer);
-  });
+  }, 30000);
 
   afterAll(async () => {
     if (app) {
@@ -80,7 +80,7 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     if (sqsHandle) {
       await sqsHandle.stop();
     }
-  });
+  }, 30000);
 
   it('1. Health & Readiness: /health/live, /health/ready (PostgreSQL + SQS reais) e /health/metrics', async () => {
     const liveRes = await fetch(`${baseUrl}/health/live`, {

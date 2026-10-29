@@ -322,30 +322,32 @@ export async function ensureSqsEndpoint(): Promise<SqsEndpointHandle> {
 
     try {
       await client.send(new ListQueuesCommand({}));
-      for (const queueName of [
-        'wager-transactions-dlq.fifo',
-        'wager-transactions.fifo',
-        'wagering-events.fifo',
-      ]) {
-        await client.send(
-          new CreateQueueCommand({
-            QueueName: queueName,
-            Attributes: {
-              FifoQueue: 'true',
-              ContentBasedDeduplication: 'true',
-            },
-          }),
-        );
-        try {
+      await Promise.all(
+        [
+          'wager-transactions-dlq.fifo',
+          'wager-transactions.fifo',
+          'wagering-events.fifo',
+        ].map(async (queueName) => {
           await client.send(
-            new PurgeQueueCommand({
-              QueueUrl: `${candidateEndpoint}/000000000000/${queueName}`,
+            new CreateQueueCommand({
+              QueueName: queueName,
+              Attributes: {
+                FifoQueue: 'true',
+                ContentBasedDeduplication: 'true',
+              },
             }),
           );
-        } catch {
-          // PurgeQueue pode ter cooldown em alguns brokers; ignorar se não suportado
-        }
-      }
+          try {
+            await client.send(
+              new PurgeQueueCommand({
+                QueueUrl: `${candidateEndpoint}/000000000000/${queueName}`,
+              }),
+            );
+          } catch {
+            // PurgeQueue pode ter cooldown em alguns brokers; ignorar se não suportado
+          }
+        }),
+      );
 
       return {
         endpoint: candidateEndpoint,

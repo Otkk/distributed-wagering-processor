@@ -109,13 +109,13 @@ describe('Real PostgreSQL Concurrency & Chaos Suite (README §13 Mandatory Scena
     dbPort = port;
     await orm.close(true);
     primaryNode = await createPostgresNode(dbPort);
-  });
+  }, 30000);
 
   afterAll(async () => {
     if (primaryNode?.orm && (await primaryNode.orm.isConnected())) {
       await primaryNode.orm.close(true);
     }
-  });
+  }, 30000);
 
   it('Cenário 1 (§13.1): Mesma aposta enviada 50 vezes em paralelo no PostgreSQL real -> único débito e 49 replays idempotentes', async () => {
     const tag = `pg-c1-${Date.now()}`;
