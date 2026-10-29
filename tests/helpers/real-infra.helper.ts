@@ -39,15 +39,16 @@ export class LocalSqsHttpServer {
 
   constructor(maxReceiveCount = 5) {
     this.maxReceiveCount = maxReceiveCount;
-    this.queues.set('wager-transactions.fifo', []);
-    this.queues.set('wager-transactions-dlq.fifo', []);
-    this.queues.set('wagering-events.fifo', []);
+    this.reset();
   }
 
   public reset(): void {
     this.queues.set('wager-transactions.fifo', []);
     this.queues.set('wager-transactions-dlq.fifo', []);
     this.queues.set('wagering-events.fifo', []);
+    this.queues.set('wager-transactions-test.fifo', []);
+    this.queues.set('wager-transactions-dlq-test.fifo', []);
+    this.queues.set('wagering-events-test.fifo', []);
     this.dedupCache.clear();
   }
 
@@ -269,6 +270,9 @@ export class LocalSqsHttpServer {
 
 export interface SqsEndpointHandle {
   endpoint: string;
+  wagerQueueUrl: string;
+  dlqQueueUrl: string;
+  eventsQueueUrl: string;
   isExternalContainer: boolean;
   localServer?: LocalSqsHttpServer;
   stop: () => Promise<void>;
@@ -294,7 +298,7 @@ async function isTcpPortOpen(host: string, port: number, timeoutMs = 800): Promi
 }
 
 /**
- * Conecta ao container LocalStack real na porta 4566 se estiver rodando (garantindo as 3 filas FIFO),
+ * Conecta ao container LocalStack real na porta 4566 se estiver rodando (garantindo as filas FIFO de produção e de teste isoladas),
  * ou sobe o LocalSqsHttpServer em porta efêmera caso o container não esteja ativo.
  * Se REQUIRE_INFRA=true ou REQUIRE_LOCALSTACK=true, exige obrigatoriamente o container LocalStack.
  */
@@ -322,12 +326,16 @@ export async function ensureSqsEndpoint(): Promise<SqsEndpointHandle> {
 
     try {
       await client.send(new ListQueuesCommand({}));
+      const allQueues = [
+        'wager-transactions-dlq.fifo',
+        'wager-transactions.fifo',
+        'wagering-events.fifo',
+        'wager-transactions-dlq-test.fifo',
+        'wager-transactions-test.fifo',
+        'wagering-events-test.fifo',
+      ];
       await Promise.all(
-        [
-          'wager-transactions-dlq.fifo',
-          'wager-transactions.fifo',
-          'wagering-events.fifo',
-        ].map(async (queueName) => {
+        allQueues.map(async (queueName) => {
           await client.send(
             new CreateQueueCommand({
               QueueName: queueName,
@@ -337,20 +345,25 @@ export async function ensureSqsEndpoint(): Promise<SqsEndpointHandle> {
               },
             }),
           );
-          try {
-            await client.send(
-              new PurgeQueueCommand({
-                QueueUrl: `${candidateEndpoint}/000000000000/${queueName}`,
-              }),
-            );
-          } catch {
-            // PurgeQueue pode ter cooldown em alguns brokers; ignorar se não suportado
+          if (queueName.endsWith('-test.fifo')) {
+            try {
+              await client.send(
+                new PurgeQueueCommand({
+                  QueueUrl: `${candidateEndpoint}/000000000000/${queueName}`,
+                }),
+              );
+            } catch {
+              // PurgeQueue pode ter cooldown em alguns brokers; ignorar se não suportado
+            }
           }
         }),
       );
 
       return {
         endpoint: candidateEndpoint,
+        wagerQueueUrl: `${candidateEndpoint}/000000000000/wager-transactions-test.fifo`,
+        dlqQueueUrl: `${candidateEndpoint}/000000000000/wager-transactions-dlq-test.fifo`,
+        eventsQueueUrl: `${candidateEndpoint}/000000000000/wagering-events-test.fifo`,
         isExternalContainer: true,
         stop: async () => {},
       };
@@ -369,27 +382,36 @@ export async function ensureSqsEndpoint(): Promise<SqsEndpointHandle> {
   const endpoint = await localServer.start(0);
   return {
     endpoint,
+    wagerQueueUrl: `${endpoint}/000000000000/wager-transactions-test.fifo`,
+    dlqQueueUrl: `${endpoint}/000000000000/wager-transactions-dlq-test.fifo`,
+    eventsQueueUrl: `${endpoint}/000000000000/wagering-events-test.fifo`,
     isExternalContainer: false,
     localServer,
     stop: () => localServer.stop(),
   };
 }
 
-async function canConnectToPostgres(port: number): Promise<boolean> {
-  let orm: MikroORM | null = null;
+async function canConnectAndPrepareTestDb(port: number, testDbName: string): Promise<boolean> {
+  let adminOrm: MikroORM | null = null;
   try {
-    orm = await MikroORM.init({
+    adminOrm = await MikroORM.init({
       ...mikroOrmConfig,
       port,
+      dbName: 'postgres',
       connect: true,
     });
-    await orm.em.getConnection().execute('SELECT 1');
-    await orm.close(true);
+    const rows = await adminOrm.em
+      .getConnection()
+      .execute(`SELECT 1 FROM pg_database WHERE datname = '${testDbName}'`);
+    if (!rows || rows.length === 0) {
+      await adminOrm.em.getConnection().execute(`CREATE DATABASE "${testDbName}"`);
+    }
+    await adminOrm.close(true);
     return true;
   } catch {
-    if (orm) {
+    if (adminOrm) {
       try {
-        await orm.close(true);
+        await adminOrm.close(true);
       } catch {
         // ignore
       }
@@ -415,23 +437,23 @@ function findLocalPostgresBinDir(): string | null {
 }
 
 /**
- * Garante que uma instância real do PostgreSQL está acessível e com as migrations aplicadas.
- * Tenta a porta configurada (5432), depois 5433, e caso necessário inicializa um cluster
- * local temporário na porta 5433 usando os binários nativos do PostgreSQL.
+ * Garante que uma instância real do PostgreSQL está acessível e com as migrations aplicadas
+ * em um banco de dados isolado de teste (`wagering_test_db`), evitando interferência caso o
+ * container da aplicação (`jungle_wagering_app`) esteja rodando em background no `wagering_db`.
  */
 export async function ensureRealPostgres(): Promise<{ port: number; orm: MikroORM }> {
   const configuredPort = Number(process.env.DB_PORT);
-  const candidatePorts =
-    process.env.REQUIRE_INFRA === 'true'
-      ? Array.from(new Set([configuredPort || 5432, 5432, 5433]))
-      : Array.from(new Set([5433, configuredPort || 5432, 5432]));
+  const testDbName = process.env.TEST_DB_NAME || 'wagering_test_db';
+  const candidatePorts = Array.from(new Set([configuredPort || 5432, 5432, 5433]));
 
   for (const port of candidatePorts) {
-    if (await canConnectToPostgres(port)) {
+    if (await canConnectAndPrepareTestDb(port, testDbName)) {
       process.env.DB_PORT = String(port);
+      process.env.DB_NAME = testDbName;
       const orm = await MikroORM.init({
         ...mikroOrmConfig,
         port,
+        dbName: testDbName,
       });
       await orm.getMigrator().up();
       return { port, orm };
@@ -450,7 +472,6 @@ export async function ensureRealPostgres(): Promise<{ port: number; orm: MikroOR
     const pgData = path.join(process.cwd(), '.pgdata-local-test');
     const pgCtl = path.join(pgBin, 'pg_ctl.exe');
     const initDb = path.join(pgBin, 'initdb.exe');
-    const psql = path.join(pgBin, 'psql.exe');
 
     if (!fs.existsSync(pgData)) {
       execFileSync(initDb, ['-D', pgData, '-U', 'postgres', '-A', 'trust', '--encoding=UTF8', '--locale=C'], {
@@ -466,21 +487,13 @@ export async function ensureRealPostgres(): Promise<{ port: number; orm: MikroOR
       // Pode já estar iniciando
     }
 
-    try {
-      execFileSync(
-        psql,
-        ['-h', 'localhost', '-p', '5433', '-U', 'postgres', '-d', 'postgres', '-c', 'CREATE DATABASE wagering_db;'],
-        { stdio: 'ignore' },
-      );
-    } catch {
-      // Banco já existe
-    }
-
-    if (await canConnectToPostgres(5433)) {
+    if (await canConnectAndPrepareTestDb(5433, testDbName)) {
       process.env.DB_PORT = '5433';
+      process.env.DB_NAME = testDbName;
       const orm = await MikroORM.init({
         ...mikroOrmConfig,
         port: 5433,
+        dbName: testDbName,
       });
       await orm.getMigrator().up();
       return { port: 5433, orm };

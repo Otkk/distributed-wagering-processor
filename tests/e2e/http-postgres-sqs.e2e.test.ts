@@ -45,10 +45,10 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     process.env.AWS_ENDPOINT = sqsEndpoint;
     process.env.AWS_ACCESS_KEY_ID = 'test';
     process.env.AWS_SECRET_ACCESS_KEY = 'test';
-    process.env.SQS_WAGER_QUEUE_URL = `${sqsEndpoint}/000000000000/wager-transactions.fifo`;
-    process.env.SQS_WAGER_DLQ_URL = `${sqsEndpoint}/000000000000/wager-transactions-dlq.fifo`;
-    process.env.SQS_OUTBOX_QUEUE_URL = `${sqsEndpoint}/000000000000/wagering-events.fifo`;
-    process.env.SQS_EVENTS_QUEUE_URL = `${sqsEndpoint}/000000000000/wagering-events.fifo`;
+    process.env.SQS_WAGER_QUEUE_URL = sqsHandle.wagerQueueUrl;
+    process.env.SQS_WAGER_DLQ_URL = sqsHandle.dlqQueueUrl;
+    process.env.SQS_OUTBOX_QUEUE_URL = sqsHandle.eventsQueueUrl;
+    process.env.SQS_EVENTS_QUEUE_URL = sqsHandle.eventsQueueUrl;
 
     // 3. Sobe a aplicação NestJS real escutando em porta TCP real
     app = await NestFactory.create(AppModule, { logger: false });
@@ -494,14 +494,14 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
     // Verifica que os eventos de integração foram publicados em wagering-events.fifo (e NÃO em wager-transactions.fifo!)
     const eventsCheck = await sqsClient.send(
       new ReceiveMessageCommand({
-        QueueUrl: `${sqsEndpoint}/000000000000/wagering-events.fifo`,
+        QueueUrl: sqsHandle.eventsQueueUrl,
         MaxNumberOfMessages: 10,
         WaitTimeSeconds: 0,
       }),
     );
     expect((eventsCheck.Messages || []).length).toBeGreaterThanOrEqual(1);
 
-    // 5.2 Publica mensagem FIFO de comando de aposta em wager-transactions.fifo (sem precisar limpar fila!)
+    // 5.2 Publica mensagem FIFO de comando de aposta na fila de comandos (sem precisar limpar fila!)
     const wagerEnvelope = {
       messageId: `msg-${runId}`,
       type: 'WagerTransactionRequested',
@@ -521,7 +521,7 @@ describe('E2E Suite: Real NestJS HTTP Server + Real PostgreSQL + Real AWS SQS SD
 
     await sqsClient.send(
       new SendMessageCommand({
-        QueueUrl: `${sqsEndpoint}/000000000000/wager-transactions.fifo`,
+        QueueUrl: sqsHandle.wagerQueueUrl,
         MessageBody: JSON.stringify(wagerEnvelope),
         MessageGroupId: wallet.id,
         MessageDeduplicationId: wagerEnvelope.data.idempotencyKey,

@@ -89,10 +89,10 @@ async function runLoadTest() {
   process.env.LOG_LEVEL = 'silent';
   process.env.AWS_REGION = 'us-east-1';
   process.env.AWS_ENDPOINT = sqsEndpoint;
-  process.env.SQS_WAGER_QUEUE_URL = `${sqsEndpoint}/000000000000/wager-transactions.fifo`;
-  process.env.SQS_WAGER_DLQ_URL = `${sqsEndpoint}/000000000000/wager-transactions-dlq.fifo`;
-  process.env.SQS_OUTBOX_QUEUE_URL = `${sqsEndpoint}/000000000000/wagering-events.fifo`;
-  process.env.SQS_EVENTS_QUEUE_URL = `${sqsEndpoint}/000000000000/wagering-events.fifo`;
+  process.env.SQS_WAGER_QUEUE_URL = sqsHandle.wagerQueueUrl;
+  process.env.SQS_WAGER_DLQ_URL = sqsHandle.dlqQueueUrl;
+  process.env.SQS_OUTBOX_QUEUE_URL = sqsHandle.eventsQueueUrl;
+  process.env.SQS_EVENTS_QUEUE_URL = sqsHandle.eventsQueueUrl;
 
   // 3. Sobe aplicação NestJS real escutando em porta TCP real
   const app: INestApplication = await NestFactory.create(AppModule, { logger: false });
