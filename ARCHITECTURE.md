@@ -70,24 +70,24 @@ A Seção 1 do desafio deixa a escolha do ORM em aberto mediante justificativa. 
 
 ### 3.1 Value Object `Money` (`decimal.js`)
 - **Proibição Absoluta de `number` / IEEE-754**: nenhum valor monetário trafega ou é calculado como `number`, `float` ou `double`.
-- O Value Object [`Money`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/models/money.ts) encapsula instâncias de `Decimal` (`decimal.js`) configuradas com precisão de 20 dígitos significativos e arredondamento bancário simétrico (`ROUND_HALF_EVEN`, escala fixa de 2 casas decimais).
+- O Value Object [`Money`](./src/domain/models/money.ts) encapsula instâncias de `Decimal` (`decimal.js`) configuradas com precisão de 20 dígitos significativos e arredondamento bancário simétrico (`ROUND_HALF_EVEN`, escala fixa de 2 casas decimais).
 - **Validação de Entrada**: `Money.from()` aceita exclusivamente strings decimais canônicas (`^\d+(\.\d{1,2})?$`), rejeitando números negativos, `NaN`, `Infinity`, notação científica (`1e5`) ou mais de 2 casas decimais sem arredondamento explícito.
 - **No Banco de Dados**: todas as colunas financeiras utilizam `NUMERIC(18, 2)` e retornam como `string` no driver do PostgreSQL, preservando representação exata de ponta a ponta.
 
 ### 3.2 Ledger Imutável (*Append-Only*) e Invariante Universal
-- Toda alteração de saldo (`OPENING`, `BET`, `WIN`, `REFUND`, `ROLLBACK`) exige obrigatoriamente um [`WalletLedgerEntry`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/models/wallet-ledger-entry.ts) contendo `direction` (`CREDIT` ou `DEBIT`), `money`, `balanceBefore` e `balanceAfter`.
+- Toda alteração de saldo (`OPENING`, `BET`, `WIN`, `REFUND`, `ROLLBACK`) exige obrigatoriamente um [`WalletLedgerEntry`](./src/domain/models/wallet-ledger-entry.ts) contendo `direction` (`CREDIT` ou `DEBIT`), `money`, `balanceBefore` e `balanceAfter`.
 - O construtor de `WalletLedgerEntry` valida matematicamente a equação de conservação antes mesmo de persistir:
   - Para `CREDIT`: $\text{balanceBefore} + \text{money} == \text{balanceAfter}$
   - Para `DEBIT`: $\text{balanceBefore} - \text{money} == \text{balanceAfter}$
 - Transações `LOSS` registram o desfecho da rodada na tabela `wager_transactions` e emitem `WagerTransactionProcessed`, mas **não** geram entrada no ledger nem emitem `WalletBalanceChanged`, pois não alteram o saldo.
-- **Imutabilidade no PostgreSQL**: a migration [`Migration20261027000001_InitialSchema`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/database/migrations/Migration20261027000001_InitialSchema.ts) instala as triggers `trg_prevent_ledger_update` e `trg_prevent_ledger_delete` na tabela `wallet_ledger_entries`. Qualquer tentativa de `UPDATE` ou `DELETE` (mesmo via conexão administrativa) dispara exceção imediata no banco.
+- **Imutabilidade no PostgreSQL**: a migration [`Migration20261027000001_InitialSchema`](./src/infrastructure/database/migrations/Migration20261027000001_InitialSchema.ts) instala as triggers `trg_prevent_ledger_update` e `trg_prevent_ledger_delete` na tabela `wallet_ledger_entries`. Qualquer tentativa de `UPDATE` ou `DELETE` (mesmo via conexão administrativa) dispara exceção imediata no banco.
 
 ---
 
 ## 4. Estratégia de Concorrência e Isolamento por `walletId`
 
 ### 4.1 Pessimistic Write Lock (`SELECT ... FOR UPDATE`) vs Optimistic Locking
-A unidade de concorrência do sistema é a **`walletId`**. No início da transação em [`ProcessWagerTransactionUseCase`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/application/use-cases/process-wager-transaction.use-case.ts), adquirimos um lock pessimista de escrita na linha da carteira:
+A unidade de concorrência do sistema é a **`walletId`**. No início da transação em [`ProcessWagerTransactionUseCase`](./src/application/use-cases/process-wager-transaction.use-case.ts), adquirimos um lock pessimista de escrita na linha da carteira:
 
 ```sql
 SELECT * FROM wallets WHERE id = $1 FOR UPDATE;
@@ -115,7 +115,7 @@ Além das invariantes de domínio e do lock pessimista, o schema PostgreSQL imp�
 
 A idempotência é 100% persistida no PostgreSQL (nunca em cache volátil em memória) e governada pelo header obrigatório `Idempotency-Key`.
 
-### Algoritmo do `payloadHash` ([`canonical-hash.ts`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/models/canonical-hash.ts))
+### Algoritmo do `payloadHash` ([`canonical-hash.ts`](./src/domain/models/canonical-hash.ts))
 1. Extraímos exclusivamente os campos de negócio da operação (`providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money: { amount, currency }`, `referenceExternalTransactionId`). Metadados de transporte (headers HTTP, `correlationId`, `messageId` do SQS, timestamps de rede) **não** entram no cálculo.
 2. O objeto passa por **canonicalização recursiva** (`canonicalizeJson`), ordenando lexicograficamente todas as chaves em todos os níveis e removendo propriedades `undefined`.
 3. Calculamos o digest **SHA-256** (64 caracteres hexadecimais) sobre a string JSON canônica resultante.
@@ -130,7 +130,7 @@ A idempotência é 100% persistida no PostgreSQL (nunca em cache volátil em mem
 
 ## 6. Mapeamento Semântico de Status HTTP
 
-Para que o provedor de jogos saiba exatamente quando deve **parar** (erro definitivo de negócio ou validação) e quando pode **retentar** (processamento pendente ou falha transitória), adotamos o seguinte contrato HTTP no [`WageringController`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/controllers/wagering.controller.ts) e no [`GlobalHttpExceptionFilter`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/filters/http-exception.filter.ts):
+Para que o provedor de jogos saiba exatamente quando deve **parar** (erro definitivo de negócio ou validação) e quando pode **retentar** (processamento pendente ou falha transitória), adotamos o seguinte contrato HTTP no [`WageringController`](./src/infrastructure/http/controllers/wagering.controller.ts) e no [`GlobalHttpExceptionFilter`](./src/infrastructure/http/filters/http-exception.filter.ts):
 
 | Código HTTP | Significado no Domínio | Ação Recomendada ao Provedor |
 |---|---|---|
@@ -148,9 +148,9 @@ Para que o provedor de jogos saiba exatamente quando deve **parar** (erro defini
 ## 7. Mensageria Assíncrona: SQS, Transactional Outbox, Inbox e Referências Fora de Ordem
 
 ### 7.1 Transactional Outbox (`OutboxDispatcherWorker` — Padrão *Claim-Publish-Confirm*)
-- Eventos de integração ([`WalletBalanceChanged`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/events.ts), [`WagerTransactionProcessed`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/events.ts), [`WagerTransactionRejected`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/events.ts), [`WagerTransactionPendingReference`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/events.ts)) herdam da classe abstrata [`IntegrationEvent<T>`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/domain/events/integration-event.ts) e **nunca** são publicados no broker antes do commit do banco.
+- Eventos de integração ([`WalletBalanceChanged`](./src/domain/events/events.ts), [`WagerTransactionProcessed`](./src/domain/events/events.ts), [`WagerTransactionRejected`](./src/domain/events/events.ts), [`WagerTransactionPendingReference`](./src/domain/events/events.ts)) herdam da classe abstrata [`IntegrationEvent<T>`](./src/domain/events/integration-event.ts) e **nunca** são publicados no broker antes do commit do banco.
 - Eles são serializados na tabela `outbox_messages` dentro da mesma transação SQL que altera o saldo e o ledger.
-- Para evitar segurar conexões ou locks do PostgreSQL abertos durante chamadas de rede para o AWS SQS, o [`OutboxDispatcherWorker`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/messaging/outbox/outbox-dispatcher.worker.ts) implementa o protocolo **Claim-Publish-Confirm** em 3 fases:
+- Para evitar segurar conexões ou locks do PostgreSQL abertos durante chamadas de rede para o AWS SQS, o [`OutboxDispatcherWorker`](./src/infrastructure/messaging/outbox/outbox-dispatcher.worker.ts) implementa o protocolo **Claim-Publish-Confirm** em 3 fases:
   1. **Fase 1 — Claim (Transação SQL curta, `< 2 ms`)**: seleciona um lote pendente vinculado ao `TransactionContext` ativo via:
      ```sql
      SELECT * FROM outbox_messages
@@ -164,7 +164,7 @@ Para que o provedor de jogos saiba exatamente quando deve **parar** (erro defini
    3. **Fase 3 — Confirm (Transação SQL curta)**: grava `published_at = NOW()` em caso de sucesso ou chama `scheduleRetry(now)` (incrementando `attempts` e agendando *exponential backoff* $\min(2^{\text{attempts}} \times 500\text{ms}, 60\text{s})$) em caso de falha. Se o processo sofrer `SIGKILL` durante a Fase 2, o lease de 30s expira automaticamente e outra instância assume o envio.
 
 ### 7.2 Consumer SQS, Persistent Inbox, DLQ e Graceful Shutdown (`SIGTERM`)
-- O [`WagerTransactionConsumer`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/messaging/sqs/wager-transaction.consumer.ts) consome a fila FIFO de comandos `wager-transactions.fifo` reutilizando exatamente o mesmo `ProcessWagerTransactionUseCase`.
+- O [`WagerTransactionConsumer`](./src/infrastructure/messaging/sqs/wager-transaction.consumer.ts) consome a fila FIFO de comandos `wager-transactions.fifo` reutilizando exatamente o mesmo `ProcessWagerTransactionUseCase`.
 - **Deduplicação via Inbox**: cada mensagem recebida é registrada na tabela `inbox_messages` (`PRIMARY KEY (consumer_name, message_id)`) dentro da mesma transação SQL da aposta, sob o lock pessimista da carteira.
 - **ACK Estritamente Pós-Commit**: o comando `DeleteMessage` no SQS só é invocado **após** o commit da transação no PostgreSQL. Se o worker morrer entre o commit e o ACK, o SQS reentregará a mensagem após o *Visibility Timeout*; a segunda instância detectará o registro já processado em `inbox_messages` (e a `idempotency_key` em `wager_transactions`) e confirmará o ACK sem duplicar o débito/crédito.
 - **Classificação de Falhas e DLQ**:
@@ -176,18 +176,18 @@ Para que o provedor de jogos saiba exatamente quando deve **parar** (erro defini
 ### 7.3 Resolução de Referências Fora de Ordem (`PendingReferenceWorker`)
 - Como filas distribuídas ou integrações multi-canal podem entregar um `REFUND` ou `ROLLBACK` antes da `BET`/`WIN` original (Seção 7.1), adotamos a **Opção B (Armazenamento em `PENDING_REFERENCE` + Resolução Assíncrona)**:
   1. Quando a referência ainda não existe, a transação é salva com status `PENDING_REFERENCE` e emite `WagerTransactionPendingReference` (`HTTP 202 Accepted`).
-  2. O [`PendingReferenceWorker`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/messaging/outbox/pending-reference.worker.ts) varre periodicamente as transações em `PENDING_REFERENCE`. Assim que a transação referenciada chega e atinge estado `PROCESSED`, o worker reexecuta o caso de uso aplicando a reversão no saldo e no ledger.
+  2. O [`PendingReferenceWorker`](./src/infrastructure/messaging/outbox/pending-reference.worker.ts) varre periodicamente as transações em `PENDING_REFERENCE`. Assim que a transação referenciada chega e atinge estado `PROCESSED`, o worker reexecuta o caso de uso aplicando a reversão no saldo e no ledger.
   3. Se a referência nunca chegar após `maxAttempts` (default: 5) ou `ttlMs` (default: 60s), o worker transiciona a transação para `REJECTED` com `failureCode = REFERENCE_TIMEOUT` e emite `WagerTransactionRejected`, evitando que transações órfãs fiquem pendentes indefinidamente.
 
 ### 7.4 Observabilidade de Conflitos de Lock e Divergências Contábeis (Seções 9 e 12)
-- **Conflitos de Lock por Carteira (`lockConflictsCount`)**: sempre que duas ou mais transações concorrentes disputam simultaneamente o lock pessimista (`SELECT ... FOR UPDATE`) sobre o mesmo `walletId`, o observador injetado em `ProcessWagerTransactionUseCase` incrementa `lockConflictsCount` no [`MetricsService`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/metrics/metrics.service.ts). Operações paralelas em carteiras distintas não geram conflito.
-- **Divergência na Reconciliação (`reconciliationDivergencesCount`)**: conforme exigido na Seção 9, o [`ReconcileWalletUseCase`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/application/use-cases/reconcile-wallet.use-case.ts) **jamais** sobrescreve silenciosamente o saldo caso detecte `storedBalance !== calculatedBalance`. Ele sinaliza `consistent: false` e `difference` na resposta HTTP, registra um erro estruturado (`logger.error`) com os saldos divergentes e incrementa `reconciliationDivergencesCount` em `/health/metrics`.
+- **Conflitos de Lock por Carteira (`lockConflictsCount`)**: sempre que duas ou mais transações concorrentes disputam simultaneamente o lock pessimista (`SELECT ... FOR UPDATE`) sobre o mesmo `walletId`, o observador injetado em `ProcessWagerTransactionUseCase` incrementa `lockConflictsCount` no [`MetricsService`](./src/infrastructure/metrics/metrics.service.ts). Operações paralelas em carteiras distintas não geram conflito.
+- **Divergência na Reconciliação (`reconciliationDivergencesCount`)**: conforme exigido na Seção 9, o [`ReconcileWalletUseCase`](./src/application/use-cases/reconcile-wallet.use-case.ts) **jamais** sobrescreve silenciosamente o saldo caso detecte `storedBalance !== calculatedBalance`. Ele sinaliza `consistent: false` e `difference` na resposta HTTP, registra um erro estruturado (`logger.error`) com os saldos divergentes e incrementa `reconciliationDivergencesCount` em `/health/metrics`.
 
 ---
 
 ## 8. Autenticação e Identidade de Provedores (Seção 2)
 
-Em conformidade com a Seção 2 do desafio (que define autenticação como opcional e fora do foco central de consistência/concorrência), não implementamos cadastro de usuários ou emissão artesanal de credenciais. Definimos a porta de extensão [`ProviderIdentityPort`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts) consumida pelo [`AuthGuard`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/infrastructure/http/guards/auth.guard.ts), registrado globalmente via `APP_GUARD` no [`AppModule`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/src/app.module.ts):
+Em conformidade com a Seção 2 do desafio (que define autenticação como opcional e fora do foco central de consistência/concorrência), não implementamos cadastro de usuários ou emissão artesanal de credenciais. Definimos a porta de extensão [`ProviderIdentityPort`](./src/infrastructure/http/guards/auth.guard.ts) consumida pelo [`AuthGuard`](./src/infrastructure/http/guards/auth.guard.ts), registrado globalmente via `APP_GUARD` no [`AppModule`](./src/app.module.ts):
 - Os endpoints `/health/live`, `/health/ready` e `/health/metrics` são explicitamente abertos (`path.startsWith('/health')`).
 - No MVP, o adaptador `NoopProviderIdentityPort` está registrado por padrão para facilitar os testes funcionais e de carga. Em produção, basta substituir o provider `ProviderIdentityPort` por um adaptador OIDC/JWKS (**Keycloak**, **Zitadel**, **AWS Cognito**) ou validação HMAC-SHA256 (`X-Provider-Signature`).
 
@@ -195,7 +195,7 @@ Em conformidade com a Seção 2 do desafio (que define autenticação como opcio
 
 ## 9. Experimento de Carga Real (`bun run test:load` — HTTP + PostgreSQL + SQS + `autocannon`)
 
-Implementamos o benchmark automatizado em [`tests/load/load-test.ts`](file:///c:/Users/otako/OneDrive/%C3%81rea%20de%20Trabalho/Projetos/teste-jungleGaming/tests/load/load-test.ts) (executável via `bun run test:load`), que sobe a **aplicação NestJS real escutando via HTTP**, conectada a uma instância **real do PostgreSQL** (executando `SELECT ... FOR UPDATE`, `INSERT`, `UPDATE`, `COMMIT` com escrita em disco) e publica os eventos da Outbox via HTTP usando `@aws-sdk/client-sqs` (conectando automaticamente ao container LocalStack na porta `4566` quando ativo, ou ao servidor HTTP SQS local `LocalSqsHttpServer` caso o container não esteja rodando).
+Implementamos o benchmark automatizado em [`tests/load/load-test.ts`](./tests/load/load-test.ts) (executável via `bun run test:load`), que sobe a **aplicação NestJS real escutando via HTTP**, conectada a uma instância **real do PostgreSQL** (executando `SELECT ... FOR UPDATE`, `INSERT`, `UPDATE`, `COMMIT` com escrita em disco) e publica os eventos da Outbox via HTTP usando `@aws-sdk/client-sqs` (conectando automaticamente ao container LocalStack na porta `4566` quando ativo, ou ao servidor HTTP SQS local `LocalSqsHttpServer` caso o container não esteja rodando).
 
 ### 9.1 Ambiente do Experimento
 - **SO / Arquitetura**: Windows 11 (`win32 10.0.26200 x64`)

@@ -17,4 +17,6 @@ dist/
 .DS_Store
 Thumbs.db
 .pgdata-local-test/
+src/infrastructure/database/migrations/.snapshot-*.json
+
 
